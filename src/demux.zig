@@ -2,6 +2,7 @@ const std = @import("std");
 const BitReader = @import("bitreader.zig");
 const root = @import("root.zig");
 const Packet = root.Packet;
+const PacketType = root.PacketType;
 
 const START_PACK = 0xBA;
 const START_END = 0xB9;
@@ -14,7 +15,7 @@ pub const Demux = struct {
     start_time: f64 = root.PLM_PACKET_INVALID_TS,
     duration: f64 = root.PLM_PACKET_INVALID_TS,
 
-    start_code: ?root.PacketType = null,
+    start_code: ?PacketType = null,
     has_pack_header: bool = false,
     has_system_header: bool = false,
     has_headers: bool = false,
@@ -102,11 +103,11 @@ pub const Demux = struct {
             const code_opt = self.reader.nextStartCode();
             if (code_opt == null) break;
             const code_byte: u8 = code_opt.?;
-            if (code_byte == @intFromEnum(root.PacketType.video1)) {
+            if (code_byte == @intFromEnum(PacketType.video1)) {
                 video_stream = true;
                 self.start_code = .video1;
-            } else if (code_byte >= @intFromEnum(root.PacketType.audio1) and code_byte <= @intFromEnum(root.PacketType.audio4)) {
-                const idx: usize = @intCast(code_byte - @intFromEnum(root.PacketType.audio1));
+            } else if (code_byte >= @intFromEnum(PacketType.audio1) and code_byte <= @intFromEnum(PacketType.audio4)) {
+                const idx: usize = @intCast(code_byte - @intFromEnum(PacketType.audio1));
                 audio_streams[idx] = true;
                 self.start_code = @enumFromInt(code_byte);
             } else {
@@ -181,9 +182,9 @@ pub const Demux = struct {
             const code_opt = self.reader.nextStartCode();
             if (code_opt == null) break;
             const code_byte: u8 = code_opt.?;
-            if (code_byte == @intFromEnum(root.PacketType.video1) or
-                code_byte == @intFromEnum(root.PacketType.private) or
-                (code_byte >= @intFromEnum(root.PacketType.audio1) and code_byte <= @intFromEnum(root.PacketType.audio4)))
+            if (code_byte == @intFromEnum(PacketType.video1) or
+                code_byte == @intFromEnum(PacketType.private) or
+                (code_byte >= @intFromEnum(PacketType.audio1) and code_byte <= @intFromEnum(PacketType.audio4)))
             {
                 self.start_code = @enumFromInt(code_byte);
                 return self.decodePacket(self.start_code.?);
@@ -192,7 +193,7 @@ pub const Demux = struct {
         return null;
     }
 
-    fn decodePacket(self: *Demux, packet_type: root.PacketType) ?*Packet {
+    fn decodePacket(self: *Demux, packet_type: PacketType) ?*Packet {
         if (!(self.reader.has(16 << 3) catch false)) {
             return null;
         }
@@ -264,7 +265,7 @@ pub const Demux = struct {
         return &self.current_packet;
     }
 
-    pub fn getStartTime(self: *Demux, packet_type: root.PacketType) f64 {
+    pub fn getStartTime(self: *Demux, packet_type: PacketType) f64 {
         if (self.start_time != root.PLM_PACKET_INVALID_TS) {
             return self.start_time;
         }
@@ -289,7 +290,7 @@ pub const Demux = struct {
     fn seekToTime(
         self: *Demux,
         seek_time: f64,
-        packet_type: root.PacketType,
+        packet_type: PacketType,
         force_intra: bool,
     ) ?*Packet {
         if (!self.hasHeaders() catch false) {
@@ -418,7 +419,7 @@ pub const Demux = struct {
         return null;
     }
 
-    pub fn getDuration(self: *Demux, packet_type: root.PacketType) f64 {
+    pub fn getDuration(self: *Demux, packet_type: PacketType) f64 {
         const maybe_size = self.reader.totalSize() orelse return root.PLM_PACKET_INVALID_TS;
         if (self.duration != root.PLM_PACKET_INVALID_TS and self.last_file_size == maybe_size) {
             return self.duration;

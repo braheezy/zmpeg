@@ -1,4 +1,5 @@
 const std = @import("std");
+const types = @import("types.zig");
 
 pub const BitReader = @This();
 // Public interface we expose
@@ -235,8 +236,73 @@ pub fn hasStartCode(self: *BitReader, code: u8) bool {
     return current != null and current.? == code;
 }
 
+pub fn discardReadBytes(self: *BitReader) void {
+    if ((self.bit_index & 7) != 0) {
+        self.reader.seek += 1;
+        self.bit_index = 0;
+    }
+
+    if (self.reader.seek == 0) return;
+
+    if (self.file != null) {
+        self.reader.seek = 0;
+        self.reader.end = 0;
+        return;
+    }
+
+    if (self.append_list) |*list| {
+        const consumed = self.reader.seek;
+        if (consumed >= list.items.len) {
+            list.shrinkRetainingCapacity(0);
+        } else {
+            const remaining_len = list.items.len - consumed;
+            const src = list.items[consumed .. consumed + remaining_len];
+            std.mem.copyForwards(u8, list.items[0..remaining_len], src);
+            list.shrinkRetainingCapacity(remaining_len);
+        }
+        self.reader.buffer = list.items;
+        self.reader.seek = 0;
+        self.reader.end = list.items.len;
+        self.bit_index = 0;
+        return;
+    }
+
+    const consumed_bytes = self.reader.seek;
+    const buffer = self.reader.buffer;
+    if (consumed_bytes >= buffer.len) {
+        self.reader.buffer = buffer[buffer.len..buffer.len];
+        self.reader.seek = 0;
+        self.reader.end = 0;
+    } else {
+        self.reader.buffer = buffer[consumed_bytes..];
+        self.reader.seek = 0;
+        self.reader.end = buffer.len - consumed_bytes;
+    }
+    self.bit_index = 0;
+}
+
 pub fn totalSize(self: *BitReader) ?usize {
     return self.total_size;
+}
+
+pub fn readVlc(self: *BitReader, table: []const types.Vlc) !i16 {
+    var state = table[0];
+    while (state.index > 0) {
+        const bit = try self.readBits(1);
+        const idx: usize = @intCast(state.index + @as(i16, @intCast(bit)));
+        state = table[idx];
+    }
+    return state.value;
+}
+
+pub fn readVlcUint(self: *BitReader, table: []const types.VlcUint) !u16 {
+    var state = table[0];
+    while (state.index > 0) {
+        const bit = try self.readBits(1);
+        const idx: usize = @intCast(state.index + @as(i16, @intCast(bit)));
+        state = table[idx];
+    }
+    return state.value;
 }
 
 // std.Io.Reader VTable implementation
@@ -534,4 +600,86 @@ test "BitReader append: signalEnd controls hasEnded" {
     br.signalEnd();
     _ = try br.readBits(8);
     try std.testing.expect(br.hasEnded());
+}
+
+test "BitReader memory: discardReadBytes compacts consumed data" {
+    const allocator = std.testing.allocator;
+    const data = [_]u8{ 0x11, 0x22, 0x33 };
+    var br = BitReader.initFromMemory(allocator, data[0..]);
+
+    _ = try br.readBits(8);
+    _ = try br.readBits(8);
+    try std.testing.expectEqual(@as(usize, 2), br.reader.seek);
+
+    br.discardReadBytes();
+
+    try std.testing.expectEqual(@as(usize, 0), br.reader.seek);
+    try std.testing.expectEqual(@as(usize, 1), br.reader.end);
+    const remaining = try br.readBits(8);
+    try std.testing.expectEqual(@as(u32, 0x33), remaining);
+    try std.testing.expect(br.hasEnded());
+}
+
+test "BitReader append: discardReadBytes shrinks buffer" {
+    const allocator = std.testing.allocator;
+    var br = try BitReader.initAppend(allocator, 4);
+    defer br.deinit();
+
+    try br.append(&.{ 0xAA, 0xBB, 0xCC });
+    _ = try br.readBits(8);
+    _ = try br.readBits(8);
+    try std.testing.expectEqual(@as(usize, 2), br.reader.seek);
+
+    br.discardReadBytes();
+
+    try std.testing.expectEqual(@as(usize, 0), br.reader.seek);
+    try std.testing.expectEqual(@as(usize, 1), br.reader.end);
+    try std.testing.expectEqual(@as(usize, 1), br.append_list.?.items.len);
+    const tail = try br.readBits(8);
+    try std.testing.expectEqual(@as(u32, 0xCC), tail);
+    try std.testing.expect(!br.hasEnded());
+    br.signalEnd();
+    try std.testing.expect(br.hasEnded());
+}
+
+test "BitReader memory: readVlc basic" {
+    const allocator = std.testing.allocator;
+    const table = [_]types.Vlc{
+        .{ .index = 1, .value = 0 },
+        .{ .index = 0, .value = 1 },
+        .{ .index = 3, .value = 0 },
+        .{ .index = 0, .value = 2 },
+        .{ .index = 0, .value = 3 },
+    };
+
+    const data = [_]u8{0b01011100};
+    var br = BitReader.initFromMemory(allocator, data[0..]);
+
+    const v1 = try br.readVlc(table[0..]);
+    try std.testing.expectEqual(@as(i16, 1), v1);
+    const v2 = try br.readVlc(table[0..]);
+    try std.testing.expectEqual(@as(i16, 2), v2);
+    const v3 = try br.readVlc(table[0..]);
+    try std.testing.expectEqual(@as(i16, 3), v3);
+}
+
+test "BitReader memory: readVlcUint basic" {
+    const allocator = std.testing.allocator;
+    const table = [_]types.VlcUint{
+        .{ .index = 1, .value = 0 },
+        .{ .index = 0, .value = 5 },
+        .{ .index = 3, .value = 0 },
+        .{ .index = 0, .value = 6 },
+        .{ .index = 0, .value = 7 },
+    };
+
+    const data = [_]u8{0b01011100};
+    var br = BitReader.initFromMemory(allocator, data[0..]);
+
+    const v1 = try br.readVlcUint(table[0..]);
+    try std.testing.expectEqual(@as(u16, 5), v1);
+    const v2 = try br.readVlcUint(table[0..]);
+    try std.testing.expectEqual(@as(u16, 6), v2);
+    const v3 = try br.readVlcUint(table[0..]);
+    try std.testing.expectEqual(@as(u16, 7), v3);
 }
