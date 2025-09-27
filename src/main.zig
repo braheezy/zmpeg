@@ -16,5 +16,8 @@ pub fn main() !void {
         _ = debug_allocator.deinit();
     };
 
-    _ = try zmpeg.BitReader.initFromFile(allocator, "test.mpg");
+    var v = try zmpeg.Video.createFromFile(allocator, "trouble-pogo.mpg");
+    defer v.deinit();
+
+    std.debug.print("duration: {d}\n", .{v.demux.getDuration(.video1)});
 }

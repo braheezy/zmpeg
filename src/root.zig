@@ -1,6 +1,8 @@
 const std = @import("std");
 
-pub const BitReader = @import("bitreader.zig").BitReader;
+pub const BitReader = @import("bitreader.zig");
+const demux_mod = @import("demux.zig");
+pub const Demux = demux_mod.Demux;
 
 // Demuxed MPEG PS packet
 // The type maps directly to the various MPEG-PES start codes. PTS is the
@@ -9,9 +11,10 @@ pub const BitReader = @import("bitreader.zig").BitReader;
 pub const PLM_PACKET_INVALID_TS = -1;
 
 pub const Packet = struct {
-    type: i32,
+    type: PacketType = .private,
     pts: f64 = 0,
-    data: []const u8,
+    length: usize = 0,
+    data: []const u8 = &[_]u8{},
 };
 
 // Decoded Video Plane
@@ -52,6 +55,61 @@ pub const Samples = struct {
     left: ?[]const f32 = null,
     right: ?[]const f32 = null,
     interleaved: ?[]const f32 = null,
+};
+
+// High-level main video struct
+pub const Video = struct {
+    allocator: std.mem.Allocator,
+    reader: BitReader,
+    demux: *Demux,
+
+    time: f64 = 0,
+    has_ended: bool = false,
+    loop_playback: bool = false,
+    has_decoders: bool = false,
+
+    video_enabled: bool = true,
+    video_packet_type: PacketType = .video1,
+    video_decoder: ?*anyopaque = null,
+
+    audio_enabled: bool = true,
+    audio_stream_index: u8 = 0,
+    audio_packet_type: PacketType = .audio1,
+    audio_lead_time: f64 = 0,
+    audio_decoder: ?*anyopaque = null,
+
+    pub fn createFromFile(allocator: std.mem.Allocator, filename: []const u8) !Video {
+        var reader = try BitReader.initFromFile(allocator, filename);
+        return Video.createWithReader(allocator, reader) catch |err| {
+            reader.deinit();
+            return err;
+        };
+    }
+
+    pub fn createFromMemory(allocator: std.mem.Allocator, data: []const u8) !Video {
+        var reader = BitReader.initFromMemory(allocator, data);
+        return Video.createWithReader(allocator, reader) catch |err| {
+            reader.deinit();
+            return err;
+        };
+    }
+
+    pub fn createWithReader(allocator: std.mem.Allocator, reader: BitReader) !Video {
+        var video = Video{
+            .allocator = allocator,
+            .reader = reader,
+            .demux = undefined,
+        };
+        errdefer video.reader.deinit();
+        video.demux = try Demux.init(allocator, &video.reader);
+
+        return video;
+    }
+
+    pub fn deinit(self: *Video) void {
+        self.demux.deinit(self.allocator);
+        self.reader.deinit();
+    }
 };
 
 // demux public API
