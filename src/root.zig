@@ -1,6 +1,6 @@
 const std = @import("std");
 
-pub const BitReader = @import("bitbuffer.zig").BitReader;
+pub const BitReader = @import("bitreader.zig").BitReader;
 
 // Demuxed MPEG PS packet
 // The type maps directly to the various MPEG-PES start codes. PTS is the
