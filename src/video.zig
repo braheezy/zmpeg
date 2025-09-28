@@ -18,6 +18,7 @@ pub const Video = struct {
     height: i32 = 0,
     mb_width: i32 = 0,
     mb_height: i32 = 0,
+    mb_size: i32 = 0,
 
     luma_width: i32 = 0,
     luma_height: i32 = 0,
@@ -25,7 +26,7 @@ pub const Video = struct {
     chroma_width: i32 = 0,
     chroma_height: i32 = 0,
 
-    start_code: PacketType = .private,
+    start_code: i32 = 0,
     picture_type: i32 = 0,
 
     motion_forward: Motion = .{},
@@ -61,16 +62,17 @@ pub const Video = struct {
     has_reference_frame: bool = false,
     assume_no_b_frames: bool = false,
 
-    pub fn init(allocator: std.mem.Allocator, reader: *BitReader, own_reader: bool) !Video {
-        var video = Video{
+    pub fn init(allocator: std.mem.Allocator, reader: *BitReader, own_reader: bool) !*Video {
+        const video = try allocator.create(Video);
+        video.* = .{
             .allocator = allocator,
             .reader = reader,
             .own_reader = own_reader,
         };
 
         if (reader.findStartCode(@intFromEnum(types.StartCode.sequence))) |code| {
-            video.start_code = @enumFromInt(code);
-            try video.decodeSequenceHeader();
+            video.start_code = code;
+            _ = try video.decodeSequenceHeader();
         }
 
         return video;
@@ -83,6 +85,14 @@ pub const Video = struct {
         if (self.own_reader) {
             self.reader.deinit();
         }
+    }
+
+    pub fn getWidth(self: *Video) i32 {
+        return if (self.hasHeaders() catch false) self.width else 0;
+    }
+
+    pub fn getHeight(self: *Video) i32 {
+        return if (self.hasHeaders() catch false) self.height else 0;
     }
 
     fn decode(self: *Video) ?*Frame {
@@ -136,20 +146,20 @@ pub const Video = struct {
         return frame;
     }
 
-    fn decodeSequenceHeader(self: *Video) bool {
+    fn decodeSequenceHeader(self: *Video) !bool {
         // 64 bit header + 2x 64 byte matrix
         const max_header_size = 64 + 2 * 64 * 8;
         if (!(self.reader.has(max_header_size) catch false)) {
             return false;
         }
-        self.width = self.reader.readBits(12) catch return false;
-        self.height = self.reader.readBits(12) catch return false;
+        self.width = @intCast(self.reader.readBits(12) catch return false);
+        self.height = @intCast(self.reader.readBits(12) catch return false);
         if (self.width <= 0 or self.height <= 0) {
             return false;
         }
         // get pixel aspect ratio
-        const pixel_aspect_ratio_code = self.reader.readBits(4) catch 0;
-        const par_last = @sizeOf(tables.pixel_aspect_ratio) / @sizeOf(tables.pixel_aspect_ratio[0]) - 1;
+        var pixel_aspect_ratio_code = self.reader.readBits(4) catch 0;
+        const par_last = tables.pixel_aspect_ratio.len - 1;
         if (pixel_aspect_ratio_code > par_last) {
             pixel_aspect_ratio_code = par_last;
         }
@@ -162,10 +172,10 @@ pub const Video = struct {
         if ((self.reader.readBits(1) catch 0) != 0) {
             for (0..64) |i| {
                 const idx = tables.zig_zag[i];
-                self.intra_quant_matrix[idx] = self.reader.readBits(8) catch return false;
+                self.intra_quant_matrix[idx] = @intCast(self.reader.readBits(8) catch return false);
             }
         } else {
-            @memcpy(self.intra_quant_matrix, tables.intra_quant_matrix);
+            @memcpy(&self.intra_quant_matrix, &tables.intra_quant_matrix);
         }
 
         self.mb_width = (self.width + 15) >> 4;
@@ -183,10 +193,10 @@ pub const Video = struct {
         const chroma_plane_size = self.chroma_width * self.chroma_height;
         const frame_data_size = (luma_plane_size + 2 * chroma_plane_size);
 
-        self.frames_data = try self.allocator.alloc(u8, frame_data_size * 3);
-        self.initFrame(&self.frame_current, self.frames_data + frame_data_size * 0);
-        self.initFrame(&self.frame_forward, self.frames_data + frame_data_size * 1);
-        self.initFrame(&self.frame_backward, self.frames_data + frame_data_size * 2);
+        self.frames_data = try self.allocator.alloc(u8, @intCast(frame_data_size * 3));
+        self.initFrame(&self.frame_current, self.frames_data[@intCast(frame_data_size * 0)..]);
+        self.initFrame(&self.frame_forward, self.frames_data[@intCast(frame_data_size * 1)..]);
+        self.initFrame(&self.frame_backward, self.frames_data[@intCast(frame_data_size * 2)..]);
 
         self.has_sequence_header = true;
         return true;
@@ -707,19 +717,31 @@ pub const Video = struct {
         const luma_plane_size = self.luma_width * self.luma_height;
         const chroma_plane_size = self.chroma_width * self.chroma_height;
 
-        frame.width = self.width;
-        frame.height = self.height;
+        frame.width = @intCast(self.width);
+        frame.height = @intCast(self.height);
         frame.y.width = self.luma_width;
         frame.y.height = self.luma_height;
         frame.y.data = base;
 
         frame.cr.width = self.chroma_width;
         frame.cr.height = self.chroma_height;
-        frame.cr.data = base + luma_plane_size;
+        frame.cr.data = base[@intCast(luma_plane_size)..];
 
         frame.cb.width = self.chroma_width;
         frame.cb.height = self.chroma_height;
-        frame.cb.data = base + luma_plane_size + chroma_plane_size;
+        frame.cb.data = base[@intCast(luma_plane_size + chroma_plane_size)..];
+    }
+
+    fn hasHeaders(self: *Video) !bool {
+        if (self.has_sequence_header) return true;
+
+        if (self.start_code != @intFromEnum(types.StartCode.sequence)) {
+            self.start_code = self.reader.findStartCode(@intFromEnum(types.StartCode.sequence)) orelse return false;
+        }
+
+        if (!try self.decodeSequenceHeader()) return false;
+
+        return true;
     }
 };
 
@@ -927,9 +949,9 @@ pub const Frame = struct {
     time: f64 = 0,
     width: u32 = 0,
     height: u32 = 0,
-    y: []u8 = &[_]u8{},
-    cr: []u8 = &[_]u8{},
-    cb: []u8 = &[_]u8{},
+    y: Plane = .{},
+    cr: Plane = .{},
+    cb: Plane = .{},
 };
 
 // Decoded Video Plane
@@ -940,8 +962,8 @@ pub const Frame = struct {
 // displayed frame. The sizes of planes are always rounded up to the nearest
 // macroblock (16px).
 pub const Plane = struct {
-    width: u32 = 0,
-    height: u32 = 0,
+    width: i32 = 0,
+    height: i32 = 0,
     data: []u8 = &[_]u8{},
 };
 

@@ -1,7 +1,7 @@
 const Vlc = @import("root.zig").Vlc;
 const VlcUint = @import("root.zig").VlcUint;
 
-pub const pixel_aspect_ratio: []f32 = .{
+pub const pixel_aspect_ratio = [_]f32{
     1.0000, // square pixels
     0.6735, // 3:4?
     0.7031, // MPEG-1 / MPEG-2 video encoding divergence?
@@ -18,7 +18,7 @@ pub const pixel_aspect_ratio: []f32 = .{
     1.2051,
 };
 
-pub const picture_rate: []f64 = .{
+pub const picture_rate = [_]f64{
     0.000,
     23.976,
     24.000,
@@ -37,7 +37,7 @@ pub const picture_rate: []f64 = .{
     0.000,
 };
 
-pub const zig_zag: []u8 = .{
+pub const zig_zag = [_]u8{
     0,  1,  8,  16, 9,  2,  3,  10,
     17, 24, 32, 25, 18, 11, 4,  5,
     12, 19, 26, 33, 40, 48, 41, 34,
@@ -48,7 +48,7 @@ pub const zig_zag: []u8 = .{
     53, 60, 61, 54, 47, 55, 62, 63,
 };
 
-pub const intra_quant_matrix: []u8 = .{
+pub const intra_quant_matrix = [_]u8{
     8,  16, 19, 22, 26, 27, 29, 34,
     16, 16, 22, 24, 27, 29, 34, 37,
     19, 22, 26, 27, 29, 34, 34, 38,
@@ -59,7 +59,7 @@ pub const intra_quant_matrix: []u8 = .{
     27, 29, 35, 38, 46, 56, 69, 83,
 };
 
-pub const premultiplier_matrix: []u8 = .{
+pub const premultiplier_matrix = [_]u8{
     32, 44, 42, 38, 32, 25, 17, 9,
     44, 62, 58, 52, 44, 35, 24, 12,
     42, 58, 55, 49, 42, 33, 23, 12,
@@ -70,7 +70,7 @@ pub const premultiplier_matrix: []u8 = .{
     9,  12, 12, 10, 9,  7,  5,  2,
 };
 
-pub const macroblock_address_increment: []Vlc = .{
+pub const macroblock_address_increment = [_]Vlc{
     .{ 1 << 1, 0 }, .{ 0, 1 }, //   0: x
     .{ 2 << 1, 0 }, .{ 3 << 1, 0 }, //   1: 0x
     .{ 4 << 1, 0 }, .{ 5 << 1, 0 }, //   2: 00x
@@ -113,12 +113,12 @@ pub const macroblock_address_increment: []Vlc = .{
     .{ 0, 23 }, .{ 0, 22 }, //  39: 0000 0100 01x
 };
 
-pub const macroblock_type_intra: []Vlc = .{
+pub const macroblock_type_intra = [_]Vlc{
     .{ 1 << 1, 0 }, .{ 0, 0x01 }, //   0: x
     .{ -1, 0 }, .{ 0, 0x11 }, //   1: 0x
 };
 
-pub const macroblock_type_predictive: []Vlc = .{
+pub const macroblock_type_predictive = [_]Vlc{
     .{ 1 << 1, 0 }, .{ 0, 0x0a }, //   0: x
     .{ 2 << 1, 0 }, .{ 0, 0x02 }, //   1: 0x
     .{ 3 << 1, 0 }, .{ 0, 0x08 }, //   2: 00x
@@ -128,7 +128,7 @@ pub const macroblock_type_predictive: []Vlc = .{
     .{ -1, 0 }, .{ 0, 0x11 }, //   6: 0000 0x
 };
 
-pub const macroblock_type_b: []Vlc = .{
+pub const macroblock_type_b = [_]Vlc{
     .{ 1 << 1, 0 }, .{ 2 << 1, 0 }, //   0: x
     .{ 3 << 1, 0 }, .{ 4 << 1, 0 }, //   1: 0x
     .{ 0, 0x0c }, .{ 0, 0x0e }, //   2: 1x
@@ -142,9 +142,9 @@ pub const macroblock_type_b: []Vlc = .{
     .{ 0, 0x16 }, .{ 0, 0x1a }, //  10: 0000 1x
 };
 
-pub const macroblock_type: []?Vlc = .{ null, macroblock_type_intra, macroblock_type_predictive, macroblock_type_b };
+pub const macroblock_type = [_]?Vlc{ null, macroblock_type_intra, macroblock_type_predictive, macroblock_type_b };
 
-pub const code_block_pattern: []Vlc = .{
+pub const code_block_pattern = [_]Vlc{
     .{ 1 << 1, 0 }, .{ 2 << 1, 0 }, //   0: x
     .{ 3 << 1, 0 }, .{ 4 << 1, 0 }, //   1: 0x
     .{ 5 << 1, 0 }, .{ 6 << 1, 0 }, //   2: 1x
@@ -210,7 +210,7 @@ pub const code_block_pattern: []Vlc = .{
     .{ 0, 47 }, .{ 0, 31 }, //  62: 0000 0011x
 };
 
-pub const motion: []Vlc = .{
+pub const motion = [_]Vlc{
     .{ 1 << 1, 0 }, .{ 0, 0 }, //   0: x
     .{ 2 << 1, 0 }, .{ 3 << 1, 0 }, //   1: 0x
     .{ 4 << 1, 0 }, .{ 5 << 1, 0 }, //   2: 00x
@@ -247,7 +247,7 @@ pub const motion: []Vlc = .{
     .{ 0, 11 }, .{ 0, -11 }, //  33: 0000 0100 01x
 };
 
-pub const dct_size_luminance: []Vlc = .{
+pub const dct_size_luminance = [_]Vlc{
     .{ 1 << 1, 0 }, .{ 2 << 1, 0 }, //   0: x
     .{ 0, 1 }, .{ 0, 2 }, //   1: 0x
     .{ 3 << 1, 0 }, .{ 4 << 1, 0 }, //   2: 1x
@@ -259,7 +259,7 @@ pub const dct_size_luminance: []Vlc = .{
     .{ 0, 8 }, .{ -1, 0 }, //   8: 1111 11x
 };
 
-pub const dct_size_chrominance: []Vlc = .{
+pub const dct_size_chrominance = [_]Vlc{
     .{ 1 << 1, 0 }, .{ 2 << 1, 0 }, //   0: x
     .{ 0, 0 }, .{ 0, 1 }, //   1: 0x
     .{ 0, 2 }, .{ 3 << 1, 0 }, //   2: 1x
@@ -271,7 +271,7 @@ pub const dct_size_chrominance: []Vlc = .{
     .{ 0, 8 }, .{ -1, 0 }, //   8: 1111 111x
 };
 
-pub const dct_size: []Vlc = .{
+pub const dct_size = [_]Vlc{
     dct_size_luminance,
     dct_size_chrominance,
     dct_size_chrominance,
@@ -279,7 +279,7 @@ pub const dct_size: []Vlc = .{
 
 //  Decoded values are unsigned. Sign bit follows in the stream.
 
-pub const dct_coeff: []VlcUint = .{
+pub const dct_coeff = [_]VlcUint{
     .{ 1 << 1, 0 }, .{ 0, 0x0001 }, //   0: x
     .{ 2 << 1, 0 }, .{ 3 << 1, 0 }, //   1: 0x
     .{ 4 << 1, 0 }, .{ 5 << 1, 0 }, //   2: 00x

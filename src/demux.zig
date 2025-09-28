@@ -42,15 +42,21 @@ pub const Demux = struct {
         allocator.destroy(self);
     }
 
-    fn hasHeaders(self: *Demux) !bool {
+    pub fn hasHeaders(self: *Demux) !bool {
         if (self.has_headers) return true;
+
+        std.debug.print("Demux.hasHeaders: attempting to read pack header\n", .{});
 
         // decode pack header
         if (!self.has_pack_header) {
             if (self.reader.findStartCode(START_PACK) == null) {
+                std.debug.print("Demux.hasHeaders: could not find pack start code\n", .{});
                 return false;
             }
-            if (!(self.reader.has(64) catch false)) return false;
+            if (!(self.reader.has(64) catch false)) {
+                std.debug.print("Demux.hasHeaders: not enough bits for pack header\n", .{});
+                return false;
+            }
 
             if ((self.reader.readBits(4) catch return false) != 0x02) return false;
 
@@ -64,23 +70,36 @@ pub const Demux = struct {
 
         // Decode system header
         if (!self.has_system_header) {
+            std.debug.print("Demux.hasHeaders: attempting to read system header\n", .{});
             if (self.reader.findStartCode(START_SYSTEM) == null) {
+                std.debug.print("Demux.hasHeaders: could not find system header\n", .{});
                 return false;
             }
-            if (!(self.reader.has(56) catch false)) return false;
+            if (!(self.reader.has(56) catch false)) {
+                std.debug.print("Demux.hasHeaders: not enough bits for system header\n", .{});
+                return false;
+            }
 
             // header_length
             self.reader.skip(16);
             // rate bound
             self.reader.skip(24);
-            self.num_audio_streams = try self.reader.readBits(6);
+            const raw_audio = try self.reader.readBits(6);
+            self.num_audio_streams = raw_audio;
             // misc flags
             self.reader.skip(5);
-            self.num_video_streams = try self.reader.readBits(5);
+            const raw_video = try self.reader.readBits(5);
+            self.num_video_streams = raw_video;
+            std.debug.print("System header streams: raw_video={d} raw_audio={d}\n", .{ raw_video, raw_audio });
 
             self.has_system_header = true;
         }
+
+        if (self.num_video_streams == 0) {
+            _ = self.probe(self.reader.reader.buffer.len);
+        }
         self.has_headers = true;
+        std.debug.print("Demux.hasHeaders: success video streams={d} audio streams={d}\n", .{ self.num_video_streams, self.num_audio_streams });
         return true;
     }
 
@@ -114,7 +133,9 @@ pub const Demux = struct {
                 self.start_code = null;
             }
 
-            if ((self.reader.tell() - previous_pos) >= probesize) break;
+            const current_pos = self.reader.tell();
+            if (current_pos <= previous_pos) break;
+            if ((current_pos - previous_pos) >= probesize) break;
         }
 
         self.num_video_streams = if (video_stream) 1 else 0;
@@ -128,12 +149,12 @@ pub const Demux = struct {
         return (self.num_video_streams != 0 or self.num_audio_streams != 0);
     }
 
-    fn getNumVideoStreams(self: *Demux) u32 {
-        if (self.has_headers) return self.num_video_streams else 0;
+    pub fn getNumVideoStreams(self: *Demux) u32 {
+        return if (self.hasHeaders() catch false) self.num_video_streams else 0;
     }
 
-    fn getNumAudioStreams(self: *Demux) u32 {
-        if (self.has_headers) return self.num_audio_streams else 0;
+    pub fn getNumAudioStreams(self: *Demux) u32 {
+        return if (self.hasHeaders() catch false) self.num_audio_streams else 0;
     }
 
     fn rewind(self: *Demux) void {
@@ -154,7 +175,7 @@ pub const Demux = struct {
         self.start_code = null;
     }
 
-    fn decode(self: *Demux) ?*Packet {
+    pub fn decode(self: *Demux) ?*Packet {
         if (!(self.hasHeaders() catch false)) {
             return null;
         }

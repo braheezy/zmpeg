@@ -16,8 +16,13 @@ pub fn main() !void {
         _ = debug_allocator.deinit();
     };
 
-    var v = try zmpeg.Video.createFromFile(allocator, "trouble-pogo.mpg");
-    defer v.deinit();
+    var mpeg = try zmpeg.createFromFile(allocator, "trouble-pogo-5s.mpg");
+    defer mpeg.deinit();
 
-    std.debug.print("duration: {d}\n", .{v.demux.getDuration(.video1)});
+    mpeg.setAudio(false);
+
+    const width = mpeg.getWidth();
+    const height = mpeg.getHeight();
+
+    std.debug.print("width: {d}, height: {d}\n", .{ width, height });
 }

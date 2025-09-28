@@ -15,6 +15,8 @@ append_ended: bool = false,
 total_size: ?usize = null,
 // internal file handle (for file mode)
 file: ?std.fs.File = null,
+// storage owned by this reader when streaming from a file
+owned_buffer: ?[]u8 = null,
 
 pub fn init(allocator: std.mem.Allocator, buffer: []u8) BitReader {
     return BitReader{
@@ -22,7 +24,7 @@ pub fn init(allocator: std.mem.Allocator, buffer: []u8) BitReader {
             .vtable = &vtable,
             .buffer = buffer,
             .seek = 0,
-            .end = 0,
+            .end = buffer.len,
         },
         .allocator = allocator,
         .total_size = null,
@@ -31,16 +33,28 @@ pub fn init(allocator: std.mem.Allocator, buffer: []u8) BitReader {
 
 pub fn initFromFile(allocator: std.mem.Allocator, filename: []const u8) !BitReader {
     const file = try std.fs.cwd().openFile(filename, .{});
-    const buffer = try allocator.alloc(u8, 8192); // Default buffer size
+    errdefer file.close();
+
+    const initial_capacity: usize = 64 * 1024;
+    const buffer = try allocator.alloc(u8, initial_capacity);
+    errdefer allocator.free(buffer);
+
     var bit_reader = BitReader.init(allocator, buffer);
+    bit_reader.reader.seek = 0;
+    bit_reader.reader.end = 0;
     bit_reader.file = file;
+    bit_reader.owned_buffer = buffer;
     bit_reader.total_size = @intCast(try file.getEndPos());
     try file.seekTo(0);
     return bit_reader;
 }
 
 pub fn initFromMemory(allocator: std.mem.Allocator, data: []const u8) BitReader {
-    return BitReader{ .reader = std.Io.Reader.fixed(data), .allocator = allocator, .total_size = data.len };
+    return BitReader{
+        .reader = std.Io.Reader.fixed(data),
+        .allocator = allocator,
+        .total_size = data.len,
+    };
 }
 
 pub fn initAppend(allocator: std.mem.Allocator, initial_capacity: usize) !BitReader {
@@ -70,8 +84,10 @@ pub fn deinit(self: *BitReader) void {
     if (self.file) |file| {
         file.close();
     }
-    // Free the internal buffer only for file mode (we allocated it)
-    if (self.file) |_| if (self.reader.buffer.len > 0) self.allocator.free(self.reader.buffer);
+    if (self.owned_buffer) |buffer| {
+        self.allocator.free(buffer);
+        self.owned_buffer = null;
+    }
     // Deinit append list if present
     if (self.append_list) |*list| list.deinit(self.allocator);
 }
@@ -83,6 +99,10 @@ pub fn has(self: *BitReader, bit_count: usize) !bool {
 
     if (available_bits >= bit_count) return true;
 
+    if (self.file == null) {
+        return false;
+    }
+
     // Try to fill more data via std.Io.Reader; treat EndOfStream as "no more bytes"
     self.reader.fillMore() catch |err| switch (err) {
         error.EndOfStream => {},
@@ -91,7 +111,13 @@ pub fn has(self: *BitReader, bit_count: usize) !bool {
 
     const new_available_bytes = self.reader.end - self.reader.seek;
     const new_available_bits = (new_available_bytes << 3) - self.bit_index;
-    return new_available_bits >= bit_count;
+    if (new_available_bits >= bit_count) return true;
+
+    if (self.file != null and new_available_bytes == available_bytes) {
+        return false;
+    }
+
+    return false;
 }
 
 pub fn readBits(self: *BitReader, bit_count: u5) !u32 {
@@ -206,9 +232,9 @@ pub fn nextStartCode(self: *BitReader) ?u8 {
     self.alignToByte();
     while (self.has(5 << 3) catch false) {
         const idx = self.reader.seek;
-        const buf = self.reader.buffer;
-        if (buf[idx] == 0x00 and buf[idx + 1] == 0x00 and buf[idx + 2] == 0x01) {
-            const code = buf[idx + 3];
+        const b = self.reader.buffer;
+        if (b[idx] == 0x00 and b[idx + 1] == 0x00 and b[idx + 2] == 0x01) {
+            const code = b[idx + 3];
             self.reader.seek = idx + 4;
             self.bit_index = 0;
             return code;
@@ -368,14 +394,29 @@ fn discard(r: *std.Io.Reader, limit: std.Io.Limit) std.Io.Reader.Error!usize {
 fn readVec(r: *std.Io.Reader, data: [][]u8) std.Io.Reader.Error!usize {
     const self: *BitReader = @fieldParentPtr("reader", r);
     if (self.file) |file| {
-        // File mode - read from file
+        var vec_storage: [8][]u8 = undefined;
+        const dest_count, const data_size = try r.writableVector(&vec_storage, data);
+        const dest = vec_storage[0..dest_count];
+
         var total_read: usize = 0;
-        for (data) |slice| {
-            const bytes_read = file.read(slice) catch |err| switch (err) {
-                else => return error.ReadFailed,
+        for (dest) |slice| {
+            if (slice.len == 0) continue;
+            const bytes_read = file.read(slice) catch {
+                return error.ReadFailed;
             };
             total_read += bytes_read;
-            if (bytes_read < slice.len) break;
+            if (bytes_read < slice.len) {
+                if (total_read > data_size) {
+                    r.end += total_read - data_size;
+                }
+                if (total_read == 0) return error.EndOfStream;
+                return total_read;
+            }
+        }
+
+        if (total_read == 0) return error.EndOfStream;
+        if (total_read > data_size) {
+            r.end += total_read - data_size;
         }
         return total_read;
     } else {
@@ -394,15 +435,45 @@ fn readVec(r: *std.Io.Reader, data: [][]u8) std.Io.Reader.Error!usize {
     }
 }
 
-fn rebase(r: *std.Io.Reader, _: usize) std.Io.Reader.RebaseError!void {
+fn rebase(r: *std.Io.Reader, capacity: usize) std.Io.Reader.RebaseError!void {
     const self: *BitReader = @fieldParentPtr("reader", r);
     if (self.file) |_| {
-        // File mode - no rebasing needed
-        return;
-    } else {
-        // Memory mode - no rebasing needed for fixed data
+        const tail_len = r.end - r.seek;
+        const required = tail_len + capacity;
+
+        if (self.owned_buffer) |buffer| {
+            var current = buffer;
+            if (required > current.len) {
+                var new_capacity = current.len;
+                if (new_capacity == 0) new_capacity = capacity;
+                while (new_capacity < required) {
+                    new_capacity *= 2;
+                }
+                current = try reallocOwnedBuffer(self, current, new_capacity);
+                self.owned_buffer = current;
+                self.reader.buffer = current;
+            }
+        } else if (required > self.reader.buffer.len) {
+            return error.EndOfStream;
+        }
+
+        if (tail_len > 0 and r.seek != 0) {
+            const src = self.reader.buffer[r.seek .. r.seek + tail_len];
+            std.mem.copyForwards(u8, self.reader.buffer[0..tail_len], src);
+        }
+        r.seek = 0;
+        r.end = tail_len;
         return;
     }
+
+    return std.Io.Reader.defaultRebase(r, capacity);
+}
+
+fn reallocOwnedBuffer(self: *BitReader, buf: []u8, new_capacity: usize) std.Io.Reader.RebaseError![]u8 {
+    const new_buf = self.allocator.realloc(buf, new_capacity) catch {
+        return error.EndOfStream;
+    };
+    return new_buf;
 }
 
 test "BitReader append: incremental bit reads across boundary" {
