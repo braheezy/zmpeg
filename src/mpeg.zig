@@ -103,6 +103,7 @@ pub const Mpeg = struct {
                     reader_ptr,
                     false,
                 );
+                try self.primeVideoDecoder();
             }
         } else {
             @panic("No video streams");
@@ -142,11 +143,40 @@ pub const Mpeg = struct {
         return reader_ptr;
     }
 
+    fn primeVideoDecoder(self: *Mpeg) !void {
+        if (self.video_decoder == null) return;
+        const decoder = self.video_decoder.?;
+        const reader = decoder.reader;
+        var attempts: usize = 0;
+        while (!decoder.ensurePictureStart()) {
+            if (attempts >= 128) return error.MissingSequenceHeader;
+            const packet = self.demux.decode() orelse return error.MissingSequenceHeader;
+            if (packet.type == self.video_packet_type.?) {
+                if (self.video_reader) |video_reader| {
+                    try video_reader.append(packet.data);
+                    video_reader.seekTo(0);
+                } else {
+                    try reader.append(packet.data);
+                    reader.seekTo(0);
+                }
+            }
+            attempts += 1;
+        }
+    }
+
     fn ensureVideoSequenceHeader(self: *Mpeg, reader: *BitReader) !void {
         if (self.video_packet_type == null) return;
         reader.seekTo(0);
         const seq_code: u8 = @intCast(@intFromEnum(types.StartCode.sequence));
+        const pic_code: u8 = @intCast(@intFromEnum(types.StartCode.picture));
         while (!reader.hasStartCode(seq_code)) {
+            const packet = self.demux.decode() orelse return error.MissingSequenceHeader;
+            if (packet.type == self.video_packet_type.?) {
+                try reader.append(packet.data);
+                reader.seekTo(0);
+            }
+        }
+        while (!reader.hasStartCode(pic_code)) {
             const packet = self.demux.decode() orelse return error.MissingSequenceHeader;
             if (packet.type == self.video_packet_type.?) {
                 try reader.append(packet.data);

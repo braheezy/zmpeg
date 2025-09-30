@@ -95,15 +95,18 @@ pub const Video = struct {
         return if (self.hasHeaders() catch false) self.height else 0;
     }
 
-    fn decode(self: *Video) ?*Frame {
+    pub fn decode(self: *Video) ?*Frame {
         if (!self.has_sequence_header) {
             return null;
         }
 
         var frame: ?*Frame = null;
+        const picture_code_i32 = @intFromEnum(types.StartCode.picture);
+        const picture_code_u8: u8 = @intCast(picture_code_i32);
+
         while (frame == null) {
-            if (self.start_code != .picture) {
-                self.start_code = self.reader.findStartCode(.picture) orelse {
+            if (self.start_code != picture_code_i32) {
+                self.start_code = @intCast(self.reader.findStartCode(picture_code_u8) orelse {
                     // If we reached the end of the file and the previously decoded
                     // frame was a reference frame, we still have to return it.
                     if (self.has_reference_frame and !self.assume_no_b_frames and self.reader.hasEnded() and
@@ -114,7 +117,7 @@ pub const Video = struct {
                         break;
                     }
                     return null;
-                };
+                });
             }
 
             // Make sure we have a full picture in the buffer before attempting to
@@ -122,15 +125,15 @@ pub const Video = struct {
             // of the next picture. Also, if we didn't find the start code for the
             // next picture, but the source has ended, we assume that this last
             // picture is in the buffer.
-            if (self.reader.hasStartCode(.picture) and !self.reader.hasEnded()) return null;
+            if (!self.reader.hasStartCode(picture_code_u8) and !self.reader.hasEnded()) return null;
 
             self.reader.discardReadBytes();
 
-            self.decodePicture();
+            self.decodePicture() catch return null;
 
             if (self.assume_no_b_frames) {
                 frame = &self.frame_backward;
-            } else if (self.picture_type == .b) {
+            } else if (self.picture_type == @intFromEnum(PictureType.b)) {
                 frame = &self.frame_current;
             } else if (self.has_reference_frame) {
                 frame = &self.frame_forward;
@@ -139,11 +142,27 @@ pub const Video = struct {
             }
         }
 
-        frame.time = self.time;
+        const out_frame = frame.?;
+        out_frame.time = self.time;
         self.frames_decoded += 1;
         self.time = @as(f64, @floatFromInt(self.frames_decoded)) / self.framerate;
 
-        return frame;
+        return out_frame;
+    }
+
+    pub fn ensurePictureStart(self: *Video) bool {
+        const picture_code = @intFromEnum(types.StartCode.picture);
+        if (self.start_code == picture_code) return true;
+        const saved_seek = self.reader.reader.seek;
+        const saved_bit = self.reader.bit_index;
+        const picture_code_u8: u8 = @intCast(picture_code);
+        if (self.reader.findStartCode(picture_code_u8)) |code| {
+            self.start_code = @intCast(code);
+            return true;
+        }
+        self.reader.reader.seek = saved_seek;
+        self.reader.bit_index = saved_bit;
+        return false;
     }
 
     fn decodeSequenceHeader(self: *Video) !bool {
@@ -205,7 +224,7 @@ pub const Video = struct {
     fn decodePicture(self: *Video) !void {
         // skip temporalReference
         self.reader.skip(10);
-        self.picture_type = try self.reader.readBits(3);
+        self.picture_type = @intCast(try self.reader.readBits(3));
         // skip vbv_delay
         self.reader.skip(16);
         // D frames or unknown coding type
@@ -215,8 +234,8 @@ pub const Video = struct {
         if (self.picture_type == @intFromEnum(PictureType.predictive) or
             self.picture_type == @intFromEnum(PictureType.b))
         {
-            self.motion_forward.full_px = try self.reader.readBits(1);
-            const f_code = try self.reader.readBits(3);
+            self.motion_forward.full_px = @intCast(try self.reader.readBits(1));
+            const f_code: i32 = @intCast(try self.reader.readBits(3));
             // Ignore picture with zero f_code
             if (f_code == 0) return;
             self.motion_forward.r_size = f_code - 1;
@@ -224,8 +243,8 @@ pub const Video = struct {
 
         // Backward full_px, f_code
         if (self.picture_type == @intFromEnum(PictureType.b)) {
-            self.motion_backward.full_px = try self.reader.readBits(1);
-            const f_code = try self.reader.readBits(3);
+            self.motion_backward.full_px = @intCast(try self.reader.readBits(1));
+            const f_code: i32 = @intCast(try self.reader.readBits(3));
             // Ignore picture with zero f_code
             if (f_code == 0) return;
             self.motion_backward.r_size = f_code - 1;
@@ -251,7 +270,7 @@ pub const Video = struct {
         }
         // Decode all slices
         while (codeIsSlice(self.start_code)) {
-            self.decodeSlice(self.start_code & 0x000000FF);
+            try self.decodeSlice(self.start_code & 0x000000FF);
             if (self.macroblock_address >= self.mb_size - 2) {
                 break;
             }
@@ -282,15 +301,15 @@ pub const Video = struct {
         self.dc_predictor[1] = 128;
         self.dc_predictor[2] = 128;
 
-        self.quantizer_scale = try self.reader.readBits(5);
+        self.quantizer_scale = @intCast(try self.reader.readBits(5));
 
         // Skip extra
-        while (self.reader.readBits(1) catch return) {
+        while ((self.reader.readBits(1) catch return) != 0) {
             self.reader.skip(8);
         }
 
         while (true) {
-            self.decodeMacroblock();
+            try self.decodeMacroblock();
 
             if (self.macroblock_address < self.mb_size - 1 and self.reader.peekNonZero(23) catch return) {
                 break;
@@ -298,24 +317,24 @@ pub const Video = struct {
         }
     }
 
-    fn decodeMacroblock(self: *Video) void {
+    fn decodeMacroblock(self: *Video) !void {
         // decode increment
         var increment: i32 = 0;
-        var t = self.reader.readVlc(tables.macroblock_address_increment);
+        var t = try self.reader.readVlc(&tables.macroblock_address_increment);
 
         while (t == 34) {
             // macroblock_stuffing
-            t = self.reader.readVlc(tables.macroblock_address_increment);
+            t = try self.reader.readVlc(&tables.macroblock_address_increment);
         }
         while (t == 35) {
             // macroblock_escape
             increment += 33;
-            t = self.reader.readVlc(tables.macroblock_address_increment);
+            t = try self.reader.readVlc(&tables.macroblock_address_increment);
         }
         increment += t;
 
         // Process any skipped macroblocks
-        if (self.slice_begin) {
+        if (self.slice_begin != 0) {
             // The first increment of each slice is relative to beginning of the
             // previous row, not the previous macroblock
             self.slice_begin = 0;
@@ -339,32 +358,32 @@ pub const Video = struct {
             // Predict skipped macroblocks
             while (increment > 1) {
                 self.macroblock_address += 1;
-                self.mb_row = self.macroblock_address / self.mb_width;
-                self.mb_col = self.macroblock_address % self.mb_width;
+                self.mb_row = @divTrunc(self.macroblock_address, self.mb_width);
+                self.mb_col = @mod(self.macroblock_address, self.mb_width);
                 self.predictMacroblock();
                 increment -= 1;
             }
             self.macroblock_address += 1;
         }
 
-        self.mb_row = self.macroblock_address / self.mb_width;
-        self.mb_col = self.macroblock_address % self.mb_width;
+        self.mb_row = @divTrunc(self.macroblock_address, self.mb_width);
+        self.mb_col = @mod(self.macroblock_address, self.mb_width);
 
         if (self.mb_col >= self.mb_width or self.mb_row >= self.mb_height) {
             return; // corrupt stream;
         }
 
         // Process the current macroblock
-        const tbl = tables.macroblock_type[self.picture_type];
-        self.macroblock_type = self.reader.readVlc(tbl);
+        const tbl = tables.macroblock_type[@intCast(self.picture_type)];
+        self.macroblock_type = try self.reader.readVlc(tbl.?);
 
-        self.macroblock_intra = (self.macroblock_type & 0x01);
-        self.motion_forward.is_set = (self.macroblock_type & 0x08);
-        self.motion_backward.is_set = (self.macroblock_type & 0x04);
+        self.macroblock_intra = (self.macroblock_type & 0x01) != 0;
+        self.motion_forward.is_set = (self.macroblock_type & 0x08) != 0;
+        self.motion_backward.is_set = (self.macroblock_type & 0x04) != 0;
 
         // Quantizer scale
         if ((self.macroblock_type & 0x10) != 0) {
-            self.quantizer_scale = self.reader.readBits(5);
+            self.quantizer_scale = @intCast(try self.reader.readBits(5));
         }
 
         if (self.macroblock_intra) {
@@ -384,22 +403,20 @@ pub const Video = struct {
         }
 
         // Decode blocks
-        const cbp = if ((self.macroblock_type & 0x02) != 0) {
-            self.reader.readVlc(tables.code_block_pattern);
-        } else blk: {
-            if (self.macroblock_intra) break :blk 0x3f else break :blk 0;
-        };
+        const cbp: i16 = if ((self.macroblock_type & 0x02) != 0)
+            try self.reader.readVlc(&tables.code_block_pattern)
+        else if (self.macroblock_intra) 0x3f else 0;
 
         var mask: i32 = 0x20;
         for (0..6) |block| {
             if ((cbp & mask) != 0) {
-                self.decodeBlock(block);
+                try self.decodeBlock(@intCast(block));
             }
             mask >>= 1;
         }
     }
 
-    fn decodeBlock(self: *Video, block: i32) void {
+    fn decodeBlock(self: *Video, block: i32) !void {
         var n: i32 = 0;
         var quant_matrix: []const u8 = undefined;
 
@@ -407,50 +424,50 @@ pub const Video = struct {
         if (self.macroblock_intra) {
             // dc prediction
             const plane_index = if (block > 3) block - 3 else 0;
-            const predictor = self.dc_predictor[plane_index];
-            const dct_size = self.reader.readVlc(tables.dct_size[plane_index]);
+            const predictor = self.dc_predictor[@intCast(plane_index)];
+            const dct_size = try self.reader.readVlc(tables.dct_size[@intCast(plane_index)]);
 
             // Read DC coeff
             if (dct_size > 0) {
-                const differential = self.reader.readBits(dct_size);
-                if ((differential & (1 << (dct_size - 1))) != 0) {
+                const differential: i32 = @intCast(try self.reader.readBits(@intCast(dct_size)));
+                if ((differential & (@as(i32, 1) << @intCast(dct_size - 1))) != 0) {
                     self.block_data[0] = predictor + differential;
                 } else {
-                    self.block_data[0] = predictor + (-(1 << dct_size) | (differential + 1));
+                    self.block_data[0] = predictor + (-(@as(i32, 1) << @intCast(dct_size)) | (differential + 1));
                 }
             } else {
                 self.block_data[0] = predictor;
             }
 
             // Save predictor value
-            self.dc_predictor[plane_index] = self.block_data[0];
+            self.dc_predictor[@intCast(plane_index)] = self.block_data[0];
 
             // Dequantize + premultiply
             self.block_data[0] <<= (3 + 5);
 
-            quant_matrix = self.intra_quant_matrix;
+            quant_matrix = &self.intra_quant_matrix;
             n = 1;
         } else {
-            quant_matrix = self.non_intra_quant_matrix;
+            quant_matrix = &self.non_intra_quant_matrix;
         }
 
         // Decode AC coefficients (+DC for non-intra)
         var level: i32 = 0;
         while (true) {
             var run: i32 = 0;
-            const coeff = self.reader.readVlc(tables.dct_coeff);
+            const coeff = try self.reader.readVlcUint(&tables.dct_coeff);
 
             if (coeff == 0x0001 and n > 0 and !(self.reader.readBit() catch false)) {
                 break;
             }
             if (coeff == 0xffff) {
                 // escape
-                run = try self.reader.readBits(6);
-                level = try self.reader.readBits(8);
+                run = @intCast(try self.reader.readBits(6));
+                level = @intCast(try self.reader.readBits(8));
                 if (level == 0) {
-                    level = try self.reader.readBits(8);
+                    level = @intCast(try self.reader.readBits(8));
                 } else if (level == 128) {
-                    level = try self.reader.readBits(8) - 256;
+                    level = @intCast(try self.reader.readBits(8) - 256);
                 } else if (level > 128) {
                     level = level - 256;
                 }
@@ -467,7 +484,7 @@ pub const Video = struct {
                 return; // invalid
             }
 
-            const de_zig_zagged = tables.zig_zag[n];
+            const de_zig_zagged = tables.zig_zag[@intCast(n)];
             n += 1;
 
             // Dequantize, oddify, clip
@@ -509,67 +526,32 @@ pub const Video = struct {
             di = ((self.mb_row * self.luma_width) << 2) + (self.mb_col << 3);
         }
 
-        var s = &self.block_data;
-        var si = 0;
+        var s = self.block_data[0..];
+        const si = 0;
         if (self.macroblock_intra) {
             // Overwrite (no prediction)
             if (n == 1) {
                 const clamped = clampSignedToU8((s[0] + 128) >> 8);
-                blockSet(
-                    d,
-                    @intCast(di),
-                    @intCast(dw),
-                    &.{clamped},
-                    &si,
-                    1,
-                    8,
-                    DcOnlyHandler{ .value = clamped },
-                );
+                blockSet(u8, d, @intCast(di), @intCast(dw), u8, &.{clamped}, si, 1, 8, DcOnlyHandler{ .value = clamped });
                 s[0] = 0;
             } else {
                 idct(s);
                 const clamped = clampSignedToU8(s[si]);
-                blockSet(
-                    d,
-                    @intCast(di),
-                    @intCast(dw),
-                    s,
-                    &si,
-                    1,
-                    8,
-                    DcOnlyHandler{ .value = clamped },
-                );
-                @memset(self.block_data, 0);
+                blockSet(u8, d, @intCast(di), @intCast(dw), i32, s, si, 1, 8, DcOnlyHandler{ .value = clamped });
+                @memset(&self.block_data, 0);
             }
         } else {
             // Add data to the predicted macroblock
             if (n == 1) {
                 const value = (s[0] + 128) >> 8;
-                const clamped = clampSignedToU8(d[di] + value);
-                blockSet(
-                    d,
-                    @intCast(di),
-                    @intCast(dw),
-                    s,
-                    &si,
-                    1,
-                    8,
-                    DcOnlyHandler{ .value = clamped },
-                );
+                const clamped = clampSignedToU8(d[@intCast(di)] + value);
+                blockSet(u8, d, @intCast(di), @intCast(dw), i32, s, si, 1, 8, DcOnlyHandler{ .value = clamped });
+                s[0] = 0;
             } else {
                 idct(s);
-                const clamped = clampSignedToU8(d[di] + s[si]);
-                blockSet(
-                    d,
-                    @intCast(di),
-                    @intCast(dw),
-                    s,
-                    &si,
-                    1,
-                    8,
-                    DcOnlyHandler{ .value = clamped },
-                );
-                @memset(self.block_data, 0);
+                const clamped = clampSignedToU8(d[@intCast(di)] + s[si]);
+                blockSet(u8, d, @intCast(di), @intCast(dw), i32, s, si, 1, 8, DcOnlyHandler{ .value = clamped });
+                @memset(&self.block_data, 0);
             }
         }
     }
@@ -594,14 +576,15 @@ pub const Video = struct {
     }
 
     fn decodeMotionVector(self: *Video, r_size: i32, motion: i32) i32 {
-        const fscale = 1 << r_size;
-        const m_code = self.reader.readVlc(tables.motion) catch return motion;
+        var m = motion;
+        const fscale = @as(i32, 1) << @intCast(r_size);
+        const m_code = self.reader.readVlc(&tables.motion) catch return m;
         var r: i32 = 0;
         var d: i32 = 0;
 
         if ((m_code != 0) and (fscale != 1)) {
-            r = self.reader.readBits(r_size) catch return motion;
-            d = ((@abs(m_code) - 1) << r_size) + r + 1;
+            r = @intCast(self.reader.readBits(@intCast(r_size)) catch return m);
+            d = ((@abs(m_code) - 1) << @intCast(r_size)) + r + 1;
             if (m_code < 0) {
                 d = -d;
             }
@@ -609,20 +592,20 @@ pub const Video = struct {
             d = m_code;
         }
 
-        motion += d;
-        if (motion > (fscale << 4) - 1) {
-            motion -= fscale << 5;
-        } else if (motion < @as(i32, @intCast(@as(i64, @bitCast(~@as(i64, @intCast(fscale)))) << 4))) {
-            motion += fscale << 5;
+        m += d;
+        if (m > (fscale << 4) - 1) {
+            m -= fscale << 5;
+        } else if (m < @as(i32, @intCast(@as(i64, @bitCast(~@as(i64, @intCast(fscale)))) << 4))) {
+            m += fscale << 5;
         }
-        return motion;
+        return m;
     }
 
     fn predictMacroblock(self: *Video) void {
         var fw_h = self.motion_forward.h;
         var fw_v = self.motion_forward.v;
 
-        if (self.motion_forward.full_px) {
+        if (self.motion_forward.full_px != 0) {
             fw_h <<= 1;
             fw_v <<= 1;
         }
@@ -631,7 +614,7 @@ pub const Video = struct {
             var bw_h = self.motion_backward.h;
             var bw_v = self.motion_backward.v;
 
-            if (self.motion_backward.full_px) {
+            if (self.motion_backward.full_px != 0) {
                 bw_h <<= 1;
                 bw_v <<= 1;
             }
@@ -687,30 +670,29 @@ pub const Video = struct {
             @as(u3, if (odd_v) 1 else 0);
 
         switch (case_id) {
-            0 => blockSet(dest, dst_index, stride, source, src_index, stride, block_size, CopyHandler),
-            1 => blockSet(dest, dst_index, stride, source, src_index, stride, block_size, AvgVerticalHandler{ .stride = stride }),
-            2 => blockSet(dest, dst_index, stride, source, src_index, stride, block_size, AvgHorizontalHandler),
-            3 => blockSet(dest, dst_index, stride, source, src_index, stride, block_size, AvgBilinearHandler{ .stride = stride }),
-            4 => blockSet(dest, dst_index, stride, source, src_index, stride, block_size, InterpCopyHandler),
-            5 => blockSet(dest, dst_index, stride, source, src_index, stride, block_size, InterpVerticalHandler{ .stride = stride }),
-            6 => blockSet(dest, dst_index, stride, source, src_index, stride, block_size, InterpHorizontalHandler),
-            7 => blockSet(dest, dst_index, stride, source, src_index, stride, block_size, InterpBilinearHandler{ .stride = stride }),
-            else => return,
+            0 => blockSet(u8, dest, dst_index, stride, u8, source, src_index, stride, block_size, CopyHandler{}),
+            1 => blockSet(u8, dest, dst_index, stride, u8, source, src_index, stride, block_size, AvgVerticalHandler{ .stride = stride }),
+            2 => blockSet(u8, dest, dst_index, stride, u8, source, src_index, stride, block_size, AvgHorizontalHandler{}),
+            3 => blockSet(u8, dest, dst_index, stride, u8, source, src_index, stride, block_size, AvgBilinearHandler{ .stride = stride }),
+            4 => blockSet(u8, dest, dst_index, stride, u8, source, src_index, stride, block_size, InterpCopyHandler{}),
+            5 => blockSet(u8, dest, dst_index, stride, u8, source, src_index, stride, block_size, InterpVerticalHandler{ .stride = stride }),
+            6 => blockSet(u8, dest, dst_index, stride, u8, source, src_index, stride, block_size, InterpHorizontalHandler{}),
+            7 => blockSet(u8, dest, dst_index, stride, u8, source, src_index, stride, block_size, InterpBilinearHandler{ .stride = stride }),
         }
     }
 
     fn copyMacroblock(self: *Video, frame: *Frame, h: i32, v: i32) void {
         const d = &self.frame_current;
         self.processMacroblock(frame.y.data, d.y.data, h, v, 16, false);
-        self.processMacroblock(frame.cr.data, d.cr.data, h / 2, v / 2, 8, false);
-        self.processMacroblock(frame.cb.data, d.cb.data, h / 2, v / 2, 8, false);
+        self.processMacroblock(frame.cr.data, d.cr.data, @divTrunc(h, 2), @divTrunc(v, 2), 8, false);
+        self.processMacroblock(frame.cb.data, d.cb.data, @divTrunc(h, 2), @divTrunc(v, 2), 8, false);
     }
 
     fn interpolateMacroblock(self: *Video, frame: *Frame, h: i32, v: i32) void {
         const d = &self.frame_current;
         self.processMacroblock(frame.y.data, d.y.data, h, v, 16, true);
-        self.processMacroblock(frame.cr.data, d.cr.data, h / 2, v / 2, 8, true);
-        self.processMacroblock(frame.cb.data, d.cb.data, h / 2, v / 2, 8, true);
+        self.processMacroblock(frame.cr.data, d.cr.data, @divTrunc(h, 2), @divTrunc(v, 2), 8, true);
+        self.processMacroblock(frame.cb.data, d.cb.data, @divTrunc(h, 2), @divTrunc(v, 2), 8, true);
     }
 
     fn initFrame(self: *Video, frame: *Frame, base: []u8) void {
@@ -838,10 +820,12 @@ fn codeIsSlice(code: i32) bool {
 }
 
 fn blockSet(
-    dest: []u8,
+    comptime DestT: type,
+    dest: []DestT,
     dest_index: usize,
     dest_width: usize,
-    source: []const u8,
+    comptime SourceT: type,
+    source: []const SourceT,
     source_index: usize,
     source_width: usize,
     block_size: usize,
@@ -859,7 +843,7 @@ fn blockSet(
         var x: usize = 0;
         while (x < block_size) : (x += 1) {
             if (si >= source.len or di >= dest.len) return;
-            dest[di] = handler.apply(dest, di, source, si);
+            dest[di] = handler.apply(DestT, SourceT, dest, di, source, si);
             si += 1;
             di += 1;
         }
@@ -869,75 +853,153 @@ fn blockSet(
 }
 
 const CopyHandler = struct {
-    fn apply(_: []const u8, _: usize, source: []const u8, si: usize) u8 {
-        return source[si];
+    fn apply(
+        _: @This(),
+        comptime DestT: type,
+        comptime SourceT: type,
+        _: []const DestT,
+        _: usize,
+        source: []const SourceT,
+        si: usize,
+    ) DestT {
+        return @intCast(source[si]);
     }
 };
 
 const DcOnlyHandler = struct {
     value: u8,
-    fn apply(_: []const u8, _: usize, _: []const u8, _: usize) u8 {
-        return @field(@This(), "value");
+    fn apply(
+        self: @This(),
+        comptime DestT: type,
+        comptime SourceT: type,
+        _: []const DestT,
+        _: usize,
+        _: []const SourceT,
+        _: usize,
+    ) DestT {
+        return @intCast(self.value);
     }
 };
 
 const AvgVerticalHandler = struct {
     stride: usize,
-    fn apply(_: []const u8, _: usize, source: []const u8, si: usize) u8 {
-        const a = source[si];
-        const b = source[si + @field(@This(), "stride")];
+    fn apply(
+        self: @This(),
+        comptime DestT: type,
+        comptime SourceT: type,
+        _: []const DestT,
+        _: usize,
+        source: []const SourceT,
+        si: usize,
+    ) DestT {
+        const a: DestT = @intCast(source[si]);
+        const b: DestT = @intCast(source[si + self.stride]);
         return @intCast((@as(u16, a) + @as(u16, b) + 1) >> 1);
     }
 };
 
 const AvgHorizontalHandler = struct {
-    fn apply(_: []const u8, _: usize, source: []const u8, si: usize) u8 {
-        const a = source[si];
-        const b = source[si + 1];
+    fn apply(
+        _: @This(),
+        comptime DestT: type,
+        comptime SourceT: type,
+        _: []const DestT,
+        _: usize,
+        source: []const SourceT,
+        si: usize,
+    ) DestT {
+        const a: DestT = @intCast(source[si]);
+        const b: DestT = @intCast(source[si + 1]);
         return @intCast((@as(u16, a) + @as(u16, b) + 1) >> 1);
     }
 };
 
 const AvgBilinearHandler = struct {
     stride: usize,
-    fn apply(_: []const u8, _: usize, source: []const u8, si: usize) u8 {
-        const stride = @field(@This(), "stride");
-        const a = source[si];
-        const b = source[si + 1];
-        const c = source[si + stride];
-        const d = source[si + stride + 1];
+    fn apply(
+        self: @This(),
+        comptime DestT: type,
+        comptime SourceT: type,
+        _: []const DestT,
+        _: usize,
+        source: []const SourceT,
+        si: usize,
+    ) DestT {
+        const a: DestT = @intCast(source[si]);
+        const b: DestT = @intCast(source[si + 1]);
+        const c: DestT = @intCast(source[si + self.stride]);
+        const d: DestT = @intCast(source[si + self.stride + 1]);
         return @intCast((@as(u16, a) + @as(u16, b) + @as(u16, c) + @as(u16, d) + 2) >> 2);
     }
 };
 
 const InterpCopyHandler = struct {
-    fn apply(dest: []const u8, di: usize, source: []const u8, si: usize) u8 {
-        return @intCast((@as(u16, dest[di]) + @as(u16, source[si]) + 1) >> 1);
+    fn apply(
+        _: @This(),
+        comptime DestT: type,
+        comptime SourceT: type,
+        dest: []const DestT,
+        di: usize,
+        source: []const SourceT,
+        si: usize,
+    ) DestT {
+        const a: DestT = dest[di];
+        const b: DestT = @intCast(source[si]);
+        return @intCast((@as(u16, a) + @as(u16, b) + 1) >> 1);
     }
 };
 
 const InterpVerticalHandler = struct {
     stride: usize,
-    fn apply(dest: []const u8, di: usize, source: []const u8, si: usize) u8 {
-        const stride = @field(@This(), "stride");
-        const avg = (@as(u16, source[si]) + @as(u16, source[si + stride]) + 1) >> 1;
+    fn apply(
+        self: @This(),
+        comptime DestT: type,
+        comptime SourceT: type,
+        dest: []const DestT,
+        di: usize,
+        source: []const SourceT,
+        si: usize,
+    ) DestT {
+        const a: DestT = @intCast(source[si]);
+        const b: DestT = @intCast(source[si + self.stride]);
+        const avg = (@as(u16, a) + @as(u16, b) + 1) >> 1;
         return @intCast((@as(u16, dest[di]) + avg + 1) >> 1);
     }
 };
 
 const InterpHorizontalHandler = struct {
-    fn apply(dest: []const u8, di: usize, source: []const u8, si: usize) u8 {
-        const avg = (@as(u16, source[si]) + @as(u16, source[si + 1]) + 1) >> 1;
+    fn apply(
+        _: @This(),
+        comptime DestT: type,
+        comptime SourceT: type,
+        dest: []const DestT,
+        di: usize,
+        source: []const SourceT,
+        si: usize,
+    ) DestT {
+        const a: DestT = @intCast(source[si]);
+        const b: DestT = @intCast(source[si + 1]);
+        const avg = (@as(u16, a) + @as(u16, b) + 1) >> 1;
         return @intCast((@as(u16, dest[di]) + avg + 1) >> 1);
     }
 };
 
 const InterpBilinearHandler = struct {
     stride: usize,
-    fn apply(dest: []const u8, di: usize, source: []const u8, si: usize) u8 {
-        const stride = @field(@This(), "stride");
-        const a = @as(u16, source[si]) + @as(u16, source[si + 1]) + @as(u16, source[si + stride]) + @as(u16, source[si + stride + 1]);
-        const avg = (a + 2) >> 2;
+    fn apply(
+        self: @This(),
+        comptime DestT: type,
+        comptime SourceT: type,
+        dest: []const DestT,
+        di: usize,
+        source: []const SourceT,
+        si: usize,
+    ) DestT {
+        const a = @as(u16, @intCast(source[si]));
+        const b = @as(u16, @intCast(source[si + 1]));
+        const c = @as(u16, @intCast(source[si + self.stride]));
+        const d = @as(u16, @intCast(source[si + self.stride + 1]));
+        const avg = (a + b + c + d + 2) >> 2;
         return @intCast((@as(u16, dest[di]) + avg + 1) >> 1);
     }
 };

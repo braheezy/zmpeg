@@ -12,16 +12,16 @@ pub const Packet = struct {
 pub const Plane = struct {
     width: u32 = 0,
     height: u32 = 0,
-    data: []const u8 = undefined,
+    data: []u8 = undefined,
 };
 
 pub const Frame = struct {
     time: f64 = 0,
     width: u32 = 0,
     height: u32 = 0,
-    y: Plane,
-    cr: Plane,
-    cb: Plane,
+    y: Plane = .{},
+    cr: Plane = .{},
+    cb: Plane = .{},
 };
 
 pub const SAMPLES_PER_FRAME = 1152;
@@ -56,11 +56,15 @@ pub const StartCode = enum(i32) {
     picture = 0x00,
     extension = 0xB5,
     user_data = 0xB2,
+
+    pub fn fromInt(value: i32) !StartCode {
+        return @enumFromInt(value);
+    }
 };
 
 pub const Vlc = struct {
-    index: i16,
-    value: i16,
+    index: i16 = 0,
+    value: i16 = 0,
 };
 
 pub const VlcUint = struct {

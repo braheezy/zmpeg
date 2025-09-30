@@ -169,7 +169,11 @@ pub fn alignToByte(self: *BitReader) void {
 }
 
 pub fn skip(self: *BitReader, bit_count: usize) void {
-    if (self.has(bit_count) catch false) self.bit_index += bit_count;
+    if (self.has(bit_count) catch false) {
+        const total_bits = self.bit_index + bit_count;
+        self.reader.seek += total_bits >> 3;
+        self.bit_index = total_bits & 7;
+    }
 }
 
 pub fn tell(self: *BitReader) usize {
@@ -312,23 +316,29 @@ pub fn totalSize(self: *BitReader) ?usize {
 }
 
 pub fn readVlc(self: *BitReader, table: []const types.Vlc) !i16 {
-    var state = table[0];
-    while (state.index > 0) {
+    var index: i16 = 0;
+    while (true) {
         const bit = try self.readBits(1);
-        const idx: usize = @intCast(state.index + @as(i16, @intCast(bit)));
-        state = table[idx];
+        const next_index = index + @as(i16, @intCast(bit));
+        const state = table[@intCast(next_index)];
+        if (state.index <= 0) {
+            return state.value;
+        }
+        index = state.index;
     }
-    return state.value;
 }
 
 pub fn readVlcUint(self: *BitReader, table: []const types.VlcUint) !u16 {
-    var state = table[0];
-    while (state.index > 0) {
+    var index: i16 = 0;
+    while (true) {
         const bit = try self.readBits(1);
-        const idx: usize = @intCast(state.index + @as(i16, @intCast(bit)));
-        state = table[idx];
+        const next_index = index + @as(i16, @intCast(bit));
+        const state = table[@intCast(next_index)];
+        if (state.index <= 0) {
+            return state.value;
+        }
+        index = state.index;
     }
-    return state.value;
 }
 
 // std.Io.Reader VTable implementation
