@@ -7,6 +7,9 @@ const PacketType = types.PacketType;
 const FrameType = types.Frame;
 const PictureType = types.PictureType;
 
+const debug_macroblock_sample_limit = 10;
+const debug_macroblock_sentinel = 3238;
+
 pub const Video = struct {
     allocator: std.mem.Allocator,
 
@@ -62,6 +65,8 @@ pub const Video = struct {
     has_reference_frame: bool = false,
     assume_no_b_frames: bool = false,
 
+    debug_frame: ?u32 = null,
+
     pub fn init(allocator: std.mem.Allocator, reader: *BitReader, own_reader: bool) !*Video {
         const video = try allocator.create(Video);
         video.* = .{
@@ -93,6 +98,19 @@ pub const Video = struct {
 
     pub fn getHeight(self: *Video) i32 {
         return if (self.hasHeaders() catch false) self.height else 0;
+    }
+
+    pub fn setDebugFrame(self: *Video, frame_index: ?u32) void {
+        self.debug_frame = frame_index;
+    }
+
+    inline fn isDebugFrame(self: *Video) bool {
+        return self.debug_frame != null and self.frames_decoded == self.debug_frame.?;
+    }
+
+    inline fn isDebugMacroblock(self: *Video) bool {
+        if (!self.isDebugFrame()) return false;
+        return self.macroblock_address < debug_macroblock_sample_limit or self.macroblock_address == debug_macroblock_sentinel;
     }
 
     pub fn decode(self: *Video) ?*Frame {
@@ -197,6 +215,15 @@ pub const Video = struct {
             @memcpy(&self.intra_quant_matrix, &tables.intra_quant_matrix);
         }
 
+        if ((self.reader.readBits(1) catch 0) != 0) {
+            for (0..64) |i| {
+                const idx = tables.zig_zag[i];
+                self.non_intra_quant_matrix[idx] = @intCast(self.reader.readBits(8) catch return false);
+            }
+        } else {
+            @memcpy(&self.non_intra_quant_matrix, &tables.non_intra_quant_matrix);
+        }
+
         self.mb_width = (self.width + 15) >> 4;
         self.mb_height = (self.height + 15) >> 4;
         self.mb_size = self.mb_width * self.mb_height;
@@ -213,9 +240,10 @@ pub const Video = struct {
         const frame_data_size = (luma_plane_size + 2 * chroma_plane_size);
 
         self.frames_data = try self.allocator.alloc(u8, @intCast(frame_data_size * 3));
-        self.initFrame(&self.frame_current, self.frames_data[@intCast(frame_data_size * 0)..]);
-        self.initFrame(&self.frame_forward, self.frames_data[@intCast(frame_data_size * 1)..]);
-        self.initFrame(&self.frame_backward, self.frames_data[@intCast(frame_data_size * 2)..]);
+        const frame_bytes: usize = @intCast(frame_data_size);
+        self.initFrame(&self.frame_current, self.frames_data[0..frame_bytes]);
+        self.initFrame(&self.frame_forward, self.frames_data[frame_bytes .. frame_bytes * 2]);
+        self.initFrame(&self.frame_backward, self.frames_data[frame_bytes * 2 .. frame_bytes * 3]);
 
         self.has_sequence_header = true;
         return true;
@@ -229,6 +257,27 @@ pub const Video = struct {
         self.reader.skip(16);
         // D frames or unknown coding type
         if (self.picture_type <= 0 or self.picture_type > @intFromEnum(PictureType.b)) return;
+
+        if (self.isDebugFrame()) {
+            std.debug.print(
+                "DBG buffers before picture frame={d} current={x} forward={x} backward={x}\n",
+                .{
+                    self.frames_decoded,
+                    @intFromPtr(self.frame_current.y.data.ptr),
+                    @intFromPtr(self.frame_forward.y.data.ptr),
+                    @intFromPtr(self.frame_backward.y.data.ptr),
+                },
+            );
+            const sample_index: usize = 819808;
+            const fb = self.frame_backward.y.data;
+            if (sample_index + 8 <= fb.len) {
+                std.debug.print("DBG frame_backward sample frame={d}:", .{self.frames_decoded});
+                for (fb[sample_index .. sample_index + 8]) |byte| {
+                    std.debug.print(" {d}", .{byte});
+                }
+                std.debug.print("\n", .{});
+            }
+        }
 
         // Forward full_px, f_code
         if (self.picture_type == @intFromEnum(PictureType.predictive) or
@@ -262,8 +311,8 @@ pub const Video = struct {
             self.start_code = self.reader.nextStartCode() orelse {
                 return;
             };
-            if (self.start_code == @intFromEnum(types.StartCode.extension) or
-                self.start_code == @intFromEnum(types.StartCode.user_data))
+            if (self.start_code != @intFromEnum(types.StartCode.extension) and
+                self.start_code != @intFromEnum(types.StartCode.user_data))
             {
                 break;
             }
@@ -285,6 +334,47 @@ pub const Video = struct {
         {
             self.frame_backward = self.frame_current;
             self.frame_current = frame_temp;
+        }
+
+        if (self.isDebugFrame()) {
+            const sample_index: usize = 819808; // MB 3238 block 0 start for trouble clip
+            const ff = self.frame_forward.y.data;
+            if (sample_index + 8 <= ff.len) {
+                std.debug.print("DBG frame_forward sample frame={d}:", .{self.frames_decoded});
+                for (ff[sample_index .. sample_index + 8]) |byte| {
+                    std.debug.print(" {d}", .{byte});
+                }
+                std.debug.print("\n", .{});
+            }
+
+            const fb_after = self.frame_backward.y.data;
+            if (sample_index + 8 <= fb_after.len) {
+                std.debug.print("DBG frame_backward (new) sample frame={d}:", .{self.frames_decoded});
+                for (fb_after[sample_index .. sample_index + 8]) |byte| {
+                    std.debug.print(" {d}", .{byte});
+                }
+                std.debug.print("\n", .{});
+            }
+
+            var name_buf: [64]u8 = undefined;
+            if (std.fmt.bufPrint(&name_buf, "zig_future_frame{d}_y.bin", .{self.frames_decoded}) catch null) |path| {
+                if (std.fs.cwd().createFile(path, .{ .truncate = true }) catch null) |file| {
+                    defer file.close();
+                    _ = file.write(fb_after) catch null;
+                }
+            }
+        }
+
+        if (self.isDebugFrame()) {
+            std.debug.print(
+                "DBG buffers after picture frame={d} current={x} forward={x} backward={x}\n",
+                .{
+                    self.frames_decoded,
+                    @intFromPtr(self.frame_current.y.data.ptr),
+                    @intFromPtr(self.frame_forward.y.data.ptr),
+                    @intFromPtr(self.frame_backward.y.data.ptr),
+                },
+            );
         }
     }
 
@@ -311,7 +401,7 @@ pub const Video = struct {
         while (true) {
             try self.decodeMacroblock();
 
-            if (self.macroblock_address < self.mb_size - 1 and self.reader.peekNonZero(23) catch return) {
+            if (!(self.macroblock_address < self.mb_size - 1 and (self.reader.peekNonZero(23) catch return))) {
                 break;
             }
         }
@@ -407,6 +497,23 @@ pub const Video = struct {
             try self.reader.readVlc(&tables.code_block_pattern)
         else if (self.macroblock_intra) 0x3f else 0;
 
+        if (self.isDebugMacroblock()) {
+            std.debug.print(
+                "DBG frame={d} mb={d} type=0x{x} cbp=0x{x} qscale={d} mvF=({d},{d}) mvB=({d},{d})\n",
+                .{
+                    self.frames_decoded,
+                    self.macroblock_address,
+                    self.macroblock_type,
+                    cbp,
+                    self.quantizer_scale,
+                    self.motion_forward.h,
+                    self.motion_forward.v,
+                    self.motion_backward.h,
+                    self.motion_backward.v,
+                },
+            );
+        }
+
         var mask: i32 = 0x20;
         for (0..6) |block| {
             if ((cbp & mask) != 0) {
@@ -419,13 +526,19 @@ pub const Video = struct {
     fn decodeBlock(self: *Video, block: i32) !void {
         var n: i32 = 0;
         var quant_matrix: []const u8 = undefined;
+        const debug_block = self.isDebugMacroblock() and block < 6;
+        var coeff0: i32 = 0;
+        var coeff1: i32 = 0;
+        var coeff2: i32 = 0;
+        var coeff3: i32 = 0;
 
         // Decode DC coefficient of intra-coded blocks
+        var plane_index: usize = 0;
+        var predictor: i32 = 0;
         if (self.macroblock_intra) {
-            // dc prediction
-            const plane_index = if (block > 3) block - 3 else 0;
-            const predictor = self.dc_predictor[@intCast(plane_index)];
-            const dct_size = try self.reader.readVlc(tables.dct_size[@intCast(plane_index)]);
+            plane_index = if (block > 3) @intCast(block - 3) else 0;
+            predictor = self.dc_predictor[plane_index];
+            const dct_size = try self.reader.readVlc(tables.dct_size[plane_index]);
 
             // Read DC coeff
             if (dct_size > 0) {
@@ -440,7 +553,7 @@ pub const Video = struct {
             }
 
             // Save predictor value
-            self.dc_predictor[@intCast(plane_index)] = self.block_data[0];
+            self.dc_predictor[plane_index] = self.block_data[0];
 
             // Dequantize + premultiply
             self.block_data[0] <<= (3 + 5);
@@ -463,11 +576,12 @@ pub const Video = struct {
             if (coeff == 0xffff) {
                 // escape
                 run = @intCast(try self.reader.readBits(6));
-                level = @intCast(try self.reader.readBits(8));
+                level = @as(i32, @intCast(try self.reader.readBits(8)));
                 if (level == 0) {
-                    level = @intCast(try self.reader.readBits(8));
+                    level = @as(i32, @intCast(try self.reader.readBits(8)));
                 } else if (level == 128) {
-                    level = @intCast(try self.reader.readBits(8) - 256);
+                    const next = @as(i32, @intCast(try self.reader.readBits(8)));
+                    level = next - 256;
                 } else if (level > 128) {
                     level = level - 256;
                 }
@@ -488,13 +602,14 @@ pub const Video = struct {
             n += 1;
 
             // Dequantize, oddify, clip
-            level = @intCast(@as(u32, @intCast(level)) << 1);
+            const raw_level = level;
+            level *= 2;
             if (!self.macroblock_intra) {
                 level += if (level < 0) -1 else 1;
             }
             level = (level * self.quantizer_scale * quant_matrix[de_zig_zagged]) >> 4;
             if ((level & 1) == 0) {
-                level = if (level < 0) -1 else 1;
+                level += if (level < 0) 1 else -1;
             }
             if (level > 2047) {
                 level = 2047;
@@ -504,6 +619,20 @@ pub const Video = struct {
 
             // Save premultiplied coefficient
             self.block_data[de_zig_zagged] = level * tables.premultiplier_matrix[de_zig_zagged];
+            if (debug_block) {
+                std.debug.print(
+                    "DBG coeff frame={d} mb={d} block={d} run={d} level={d} idx={d} raw={d}\n",
+                    .{
+                        self.frames_decoded,
+                        self.macroblock_address,
+                        block,
+                        run,
+                        level,
+                        de_zig_zagged,
+                        raw_level,
+                    },
+                );
+            }
         }
 
         // Move block to its place
@@ -528,31 +657,123 @@ pub const Video = struct {
 
         var s = self.block_data[0..];
         const si = 0;
+        var before: [8]u8 = .{0} ** 8;
+        var before_len: usize = 0;
+        const dest_index = if (di >= 0) @as(usize, @intCast(di)) else 0;
+        const dest_valid = di >= 0 and dest_index < d.len;
+        if (debug_block and dest_valid) {
+            std.debug.print(
+                "DBG dest index frame={d} mb={d} block={d} dest_index={d} width={d}\n",
+                .{ self.frames_decoded, self.macroblock_address, block, dest_index, dw },
+            );
+            before_len = @min(@as(usize, 8), d.len - dest_index);
+            for (before[0..before_len], 0..) |*slot, idx| {
+                slot.* = d[dest_index + idx];
+            }
+        }
         if (self.macroblock_intra) {
             // Overwrite (no prediction)
             if (n == 1) {
                 const clamped = clampSignedToU8((s[0] + 128) >> 8);
-                blockSet(u8, d, @intCast(di), @intCast(dw), u8, &.{clamped}, si, 1, 8, DcOnlyHandler{ .value = clamped });
+                if (debug_block) {
+                    std.debug.print(
+                        "DBG intra dc frame={d} mb={d} block={d} predictor={d} shifted={d} clamped={d}\n",
+                        .{ self.frames_decoded, self.macroblock_address, block, predictor, s[0], clamped },
+                    );
+                }
+                if (dest_valid) {
+                    fillBlockConst(d, dest_index, @intCast(dw), 8, clamped);
+                }
                 s[0] = 0;
             } else {
                 idct(s);
-                const clamped = clampSignedToU8(s[si]);
-                blockSet(u8, d, @intCast(di), @intCast(dw), i32, s, si, 1, 8, DcOnlyHandler{ .value = clamped });
+                if (debug_block) {
+                    std.debug.print(
+                        "DBG idct intra row frame={d} mb={d} block={d}:",
+                        .{ self.frames_decoded, self.macroblock_address, block },
+                    );
+                    for (s[0..8]) |post| {
+                        std.debug.print(" {d}", .{post});
+                    }
+                    std.debug.print("\n", .{});
+                    coeff0 = s[0];
+                    coeff1 = s[1];
+                    coeff2 = s[2];
+                    coeff3 = s[3];
+                }
+                if (dest_valid) {
+                    blockSet(u8, d, dest_index, @intCast(dw), i32, s, si, 8, 8, IntraHandler{});
+                }
                 @memset(&self.block_data, 0);
             }
         } else {
             // Add data to the predicted macroblock
             if (n == 1) {
                 const value = (s[0] + 128) >> 8;
-                const clamped = clampSignedToU8(d[@intCast(di)] + value);
-                blockSet(u8, d, @intCast(di), @intCast(dw), i32, s, si, 1, 8, DcOnlyHandler{ .value = clamped });
+                if (debug_block) {
+                    coeff0 = s[0];
+                    coeff1 = s[1];
+                    coeff2 = s[2];
+                    coeff3 = s[3];
+                    std.debug.print(
+                        "DBG non-intra dc add frame={d} mb={d} block={d} value={d}\n",
+                        .{ self.frames_decoded, self.macroblock_address, block, value },
+                    );
+                }
+                if (dest_valid) {
+                    addBlockConst(d, dest_index, @intCast(dw), 8, value);
+                }
                 s[0] = 0;
             } else {
+                if (debug_block) {
+                    std.debug.print(
+                        "DBG pre-idct frame={d} mb={d} block={d} first_row:",
+                        .{ self.frames_decoded, self.macroblock_address, block },
+                    );
+                    for (s[0..8]) |pre| {
+                        std.debug.print(" {d}", .{pre});
+                    }
+                    std.debug.print("\n", .{});
+                }
                 idct(s);
-                const clamped = clampSignedToU8(d[@intCast(di)] + s[si]);
-                blockSet(u8, d, @intCast(di), @intCast(dw), i32, s, si, 1, 8, DcOnlyHandler{ .value = clamped });
+                if (debug_block) {
+                    coeff0 = s[0];
+                    coeff1 = s[1];
+                    coeff2 = s[2];
+                    coeff3 = s[3];
+                    std.debug.print(
+                        "DBG idct non-intra row frame={d} mb={d} block={d}:",
+                        .{ self.frames_decoded, self.macroblock_address, block },
+                    );
+                    for (s[0..8]) |post| {
+                        std.debug.print(" {d}", .{post});
+                    }
+                    std.debug.print("\n", .{});
+                }
+                if (dest_valid) {
+                    blockSet(u8, d, dest_index, @intCast(dw), i32, s, si, 8, 8, AddHandler{});
+                }
                 @memset(&self.block_data, 0);
             }
+        }
+
+        if (debug_block) {
+            const sample_len = if (dest_valid) @min(@as(usize, 8), d.len - dest_index) else @as(usize, 0);
+            std.debug.print(
+                "DBG block frame={d} mb={d} block={d} n={d} coeffs={d} {d} {d} {d} before:",
+                .{ self.frames_decoded, self.macroblock_address, block, n, coeff0, coeff1, coeff2, coeff3 },
+            );
+            var idx: usize = 0;
+            while (idx < before_len) : (idx += 1) {
+                std.debug.print(" {d}", .{before[idx]});
+            }
+            std.debug.print(" dest:", .{});
+            idx = 0;
+            while (idx < sample_len) : (idx += 1) {
+                const value = if (dest_valid and dest_index + idx < d.len) d[dest_index + idx] else 0;
+                std.debug.print(" {d}", .{value});
+            }
+            std.debug.print("\n", .{});
         }
     }
 
@@ -593,9 +814,11 @@ pub const Video = struct {
         }
 
         m += d;
-        if (m > (fscale << 4) - 1) {
+        const upper = (fscale << 4) - 1;
+        const lower = -((fscale) << 4);
+        if (m > upper) {
             m -= fscale << 5;
-        } else if (m < @as(i32, @intCast(@as(i64, @bitCast(~@as(i64, @intCast(fscale)))) << 4))) {
+        } else if (m < lower) {
             m += fscale << 5;
         }
         return m;
@@ -608,6 +831,19 @@ pub const Video = struct {
         if (self.motion_forward.full_px != 0) {
             fw_h <<= 1;
             fw_v <<= 1;
+        }
+
+        if (self.picture_type == @intFromEnum(PictureType.predictive) and self.isDebugMacroblock()) {
+            const sample_len: usize = @min(self.frame_forward.y.data.len, @as(usize, 16));
+            std.debug.print(
+                "DBG ref frame={d} mb={d} forward[0..{d}):",
+                .{ self.frames_decoded, self.macroblock_address, sample_len },
+            );
+            var idx: usize = 0;
+            while (idx < sample_len) : (idx += 1) {
+                std.debug.print(" {d}", .{self.frame_forward.y.data[idx]});
+            }
+            std.debug.print("\n", .{});
         }
 
         if (self.picture_type == @intFromEnum(PictureType.b)) {
@@ -664,6 +900,8 @@ pub const Video = struct {
         const src_index = @as(usize, @intCast(si));
         const dst_index = @as(usize, @intCast(di));
         if (src_index >= source.len or dst_index >= dest.len) return;
+        const src_start = src_index;
+        const dst_start = dst_index;
 
         const case_id: u3 = (@as(u3, if (interpolate) 1 else 0) << 2) |
             (@as(u3, if (odd_h) 1 else 0) << 1) |
@@ -678,6 +916,31 @@ pub const Video = struct {
             5 => blockSet(u8, dest, dst_index, stride, u8, source, src_index, stride, block_size, InterpVerticalHandler{ .stride = stride }),
             6 => blockSet(u8, dest, dst_index, stride, u8, source, src_index, stride, block_size, InterpHorizontalHandler{}),
             7 => blockSet(u8, dest, dst_index, stride, u8, source, src_index, stride, block_size, InterpBilinearHandler{ .stride = stride }),
+        }
+
+        if (!interpolate and block_size == 16 and self.isDebugMacroblock()) {
+            std.debug.print(
+                "DBG process macroblock frame={d} mb={d} h={d} v={d} hp={d} vp={d} case={d} src_index={d} dst_index={d}\n",
+                .{ self.frames_decoded, self.macroblock_address, motion_h, motion_v, hp, vp, case_id, src_index, dst_index },
+            );
+            const available_dest = if (dst_start < dest.len) dest.len - dst_start else 0;
+            const available_src = if (src_start < source.len) source.len - src_start else 0;
+            const sample_len = @min(@as(usize, 8), @min(available_dest, available_src));
+            std.debug.print(
+                "DBG pred frame={d} mb={d} src:",
+                .{ self.frames_decoded, self.macroblock_address },
+            );
+            var idx: usize = 0;
+            while (idx < sample_len) : (idx += 1) {
+                std.debug.print(" {d}", .{source[src_start + idx]});
+            }
+            std.debug.print(" dest:", .{});
+            idx = 0;
+            while (idx < sample_len) : (idx += 1) {
+                const dst_val = if (dst_start + idx < dest.len) dest[dst_start + idx] else 0;
+                std.debug.print(" {d}", .{dst_val});
+            }
+            std.debug.print("\n", .{});
         }
     }
 
@@ -696,22 +959,22 @@ pub const Video = struct {
     }
 
     fn initFrame(self: *Video, frame: *Frame, base: []u8) void {
-        const luma_plane_size = self.luma_width * self.luma_height;
-        const chroma_plane_size = self.chroma_width * self.chroma_height;
+        const luma_plane_size: usize = @intCast(self.luma_width * self.luma_height);
+        const chroma_plane_size: usize = @intCast(self.chroma_width * self.chroma_height);
 
         frame.width = @intCast(self.width);
         frame.height = @intCast(self.height);
         frame.y.width = self.luma_width;
         frame.y.height = self.luma_height;
-        frame.y.data = base;
+        frame.y.data = base[0..luma_plane_size];
 
         frame.cr.width = self.chroma_width;
         frame.cr.height = self.chroma_height;
-        frame.cr.data = base[@intCast(luma_plane_size)..];
+        frame.cr.data = base[luma_plane_size .. luma_plane_size + chroma_plane_size];
 
         frame.cb.width = self.chroma_width;
         frame.cb.height = self.chroma_height;
-        frame.cb.data = base[@intCast(luma_plane_size + chroma_plane_size)..];
+        frame.cb.data = base[luma_plane_size + chroma_plane_size .. luma_plane_size + chroma_plane_size * 2];
     }
 
     fn hasHeaders(self: *Video) !bool {
@@ -780,7 +1043,7 @@ fn idct(block: []i32) void {
         block[4 * 8 + i] = y6 + y7;
         block[5 * 8 + i] = x0 + y5;
         block[6 * 8 + i] = y3 - x4;
-        block[7 * 8 + i] = y4 - y3;
+        block[7 * 8 + i] = y4 - b7;
     }
 
     // transform rows
@@ -811,7 +1074,7 @@ fn idct(block: []i32) void {
         block[i + 4] = (y6 + y7 + 128) >> 8;
         block[i + 5] = (x0 + y5 + 128) >> 8;
         block[i + 6] = (y3 - x4 + 128) >> 8;
-        block[i + 7] = (y4 - y3 + 128) >> 8;
+        block[i + 7] = (y4 - b7 + 128) >> 8;
     }
 }
 
@@ -832,23 +1095,62 @@ fn blockSet(
     handler: anytype,
 ) void {
     if (block_size == 0) return;
+    if (dest_width < block_size or source_width < block_size) return;
+
+    const rows_minus_one = block_size - 1;
+    const max_dest_index = dest_index + rows_minus_one * dest_width + block_size;
+    const max_source_index = source_index + rows_minus_one * source_width + block_size;
+    if (max_dest_index > dest.len or max_source_index > source.len) return;
+
     var di = dest_index;
     var si = source_index;
-    if (di >= dest.len or si >= source.len) return;
-
     const dest_scan = dest_width - block_size;
     const source_scan = source_width - block_size;
+
     var y: usize = 0;
     while (y < block_size) : (y += 1) {
         var x: usize = 0;
         while (x < block_size) : (x += 1) {
-            if (si >= source.len or di >= dest.len) return;
             dest[di] = handler.apply(DestT, SourceT, dest, di, source, si);
+            di += 1;
             si += 1;
+        }
+        di += dest_scan;
+        si += source_scan;
+    }
+}
+
+fn fillBlockConst(dest: []u8, dest_index: usize, dest_width: usize, block_size: usize, value: u8) void {
+    if (block_size == 0) return;
+    var di = dest_index;
+    if (di >= dest.len) return;
+    const dest_scan = if (dest_width > block_size) dest_width - block_size else 0;
+    var y: usize = 0;
+    while (y < block_size) : (y += 1) {
+        var x: usize = 0;
+        while (x < block_size) : (x += 1) {
+            if (di >= dest.len) return;
+            dest[di] = value;
             di += 1;
         }
-        si = si + source_scan;
-        di = di + dest_scan;
+        di += dest_scan;
+    }
+}
+
+fn addBlockConst(dest: []u8, dest_index: usize, dest_width: usize, block_size: usize, value: i32) void {
+    if (block_size == 0) return;
+    var di = dest_index;
+    if (di >= dest.len) return;
+    const dest_scan = if (dest_width > block_size) dest_width - block_size else 0;
+    var y: usize = 0;
+    while (y < block_size) : (y += 1) {
+        var x: usize = 0;
+        while (x < block_size) : (x += 1) {
+            if (di >= dest.len) return;
+            dest[di] = clampSignedToU8(@as(i32, dest[di]) + value);
+            di += 1;
+        }
+        di += dest_scan;
     }
 }
 
@@ -878,6 +1180,34 @@ const DcOnlyHandler = struct {
         _: usize,
     ) DestT {
         return @intCast(self.value);
+    }
+};
+
+const IntraHandler = struct {
+    fn apply(
+        _: @This(),
+        comptime DestT: type,
+        comptime SourceT: type,
+        _: []const DestT,
+        _: usize,
+        source: []const SourceT,
+        si: usize,
+    ) DestT {
+        return clampSignedToU8(source[si]);
+    }
+};
+
+const AddHandler = struct {
+    fn apply(
+        _: @This(),
+        comptime DestT: type,
+        comptime SourceT: type,
+        dest: []const DestT,
+        di: usize,
+        source: []const SourceT,
+        si: usize,
+    ) DestT {
+        return clampSignedToU8(@as(i32, dest[di]) + source[si]);
     }
 };
 
