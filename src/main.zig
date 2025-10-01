@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const zmpeg = @import("zmpeg");
+const sdl = @import("sdl2");
 
 var debug_allocator: std.heap.DebugAllocator(.{}) = .init;
 
@@ -115,22 +116,16 @@ pub fn main() !void {
     defer std.process.argsFree(allocator, args);
 
     var input_path: []const u8 = "trouble-pogo-5s.mpg";
-    var debug_frame: ?usize = null;
 
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         const arg = args[i];
-        if (std.mem.startsWith(u8, arg, "--debug-frame=")) {
-            const value = arg["--debug-frame=".len..];
-            debug_frame = std.fmt.parseInt(usize, value, 10) catch {
-                std.log.warn("Ignoring invalid debug frame index: {s}", .{value});
-                continue;
-            };
-        } else if (arg.len > 0 and arg[0] != '-') {
+        if (arg.len > 0 and arg[0] != '-') {
             input_path = arg;
         }
     }
 
+    // Initialize MPEG decoder
     var mpeg = try zmpeg.createFromFile(allocator, input_path);
     defer mpeg.deinit();
 
@@ -142,69 +137,101 @@ pub fn main() !void {
     std.debug.print("width: {d}, height: {d}\n", .{ width, height });
     if (width <= 0 or height <= 0) return;
 
+    // Initialize SDL
+    try sdl.init(.{
+        .video = true,
+    });
+    defer sdl.quit();
+
+    // Create window
+    const window_width = 800;
+    const window_height = 600;
+
+    const window = try sdl.createWindow(
+        "ZMPEG Video Player",
+        .centered,
+        .centered,
+        window_width,
+        window_height,
+        .{},
+    );
+    defer window.destroy();
+
+    // Create renderer
+    const renderer = try sdl.createRenderer(window, null, .{
+        .accelerated = true,
+        .present_vsync = true,
+    });
+    defer renderer.destroy();
+
+    // Create SDL texture for video frames
+    const texture = try sdl.createTexture(
+        renderer,
+        .rgb24,
+        .streaming,
+        @intCast(width),
+        @intCast(height),
+    );
+    defer texture.destroy();
+
+    // Calculate destination rectangle to maintain aspect ratio
+    const dest_rect = calculateAspectRatioRect(window_width, window_height, @intCast(width), @intCast(height));
+
+    // Frame buffer for BGR conversion
     const row_stride = @as(usize, @intCast(width)) * 3;
     const frame_size = @as(usize, @intCast(height)) * row_stride;
     const frame_buffer = try allocator.alloc(u8, frame_size);
     defer allocator.free(frame_buffer);
 
-    var hash: u64 = fnv_offset_basis;
-    var frames_hashed: usize = 0;
+    var running = true;
+    var frame_count: usize = 0;
 
     if (mpeg.video_decoder) |video_decoder| {
         const video_reader = mpeg.video_reader;
         const packet_type = mpeg.video_packet_type;
 
         var demux_done = false;
-        while (true) {
-            if (video_decoder.decode()) |frame| {
-                const print_details = frames_hashed == 0 or (debug_frame != null and frames_hashed == debug_frame.?);
 
-                if (print_details) {
-                    var y_sum: u64 = 0;
-                    for (frame.y.data) |val| y_sum += val;
-                    std.debug.print("Y sum={d} len={} width={} height={}\n", .{ y_sum, frame.y.data.len, frame.y.width, frame.y.height });
-                    const sample_y = @min(frame.y.data.len, @as(usize, 16));
-                    std.debug.print("Y[0..{d}]:", .{sample_y});
-                    for (frame.y.data[0..sample_y]) |byte| std.debug.print(" {x:0>2}", .{byte});
-                    std.debug.print("\n", .{});
-                    const sample_cr = @min(frame.cr.data.len, @as(usize, 8));
-                    std.debug.print("Cr[0..{d}]:", .{sample_cr});
-                    for (frame.cr.data[0..sample_cr]) |byte| std.debug.print(" {x:0>2}", .{byte});
-                    std.debug.print("\n", .{});
-                    const sample_cb = @min(frame.cb.data.len, @as(usize, 8));
-                    std.debug.print("Cb[0..{d}]:", .{sample_cb});
-                    for (frame.cb.data[0..sample_cb]) |byte| std.debug.print(" {x:0>2}", .{byte});
-                    std.debug.print("\n", .{});
+        while (running) {
+            // Handle events
+            while (sdl.pollEvent()) |ev| {
+                switch (ev) {
+                    .quit => running = false,
+                    .key_down => |key| {
+                        if (key.scancode == .escape) {
+                            running = false;
+                        }
+                    },
+                    else => {},
                 }
+            }
 
+            // Try to decode a frame
+            if (video_decoder.decode()) |frame| {
+                // Convert frame to BGR
                 const frame_view: *const zmpeg.Frame = @ptrCast(frame);
                 frameToBgr(frame_view, frame_buffer, row_stride);
 
-                if (print_details) {
-                    var byte_sum: u64 = 0;
-                    for (frame_buffer[0..frame_size]) |b| byte_sum += b;
-                    const sample_len = @min(frame_size, @as(usize, 16));
-                    std.debug.print("byte_sum={d}\n", .{byte_sum});
-                    std.debug.print("pixels[0..{d}]:", .{sample_len});
-                    for (frame_buffer[0..sample_len]) |byte| std.debug.print(" {x:0>2}", .{byte});
-                    std.debug.print("\n", .{});
-                }
+                // Update SDL texture with frame data
+                try texture.update(frame_buffer, row_stride, null);
 
-                const frame_hash = hashFrame(fnv_offset_basis, frame_buffer[0..frame_size]);
-                std.debug.print(
-                    "Z frame {d} type={d} time={d:.6} hash={x:0>16}\n",
-                    .{ frames_hashed, video_decoder.picture_type, frame.time, frame_hash },
-                );
+                // Clear screen
+                try renderer.setColorRGB(0, 0, 0);
+                try renderer.clear();
 
-                hash = hashFrame(hash, frame_buffer[0..frame_size]);
-                frames_hashed += 1;
+                // Render the texture
+                try renderer.copy(texture, null, dest_rect);
+                renderer.present();
 
-                if (debug_frame) |df| {
-                    if (frames_hashed > df) break;
-                }
+                frame_count += 1;
+                std.debug.print("Frame {d} displayed\n", .{frame_count});
+
+                // Small delay to control playback speed (roughly 25 FPS)
+                sdl.delay(40);
                 continue;
             }
 
+            // If no frame available, try to get more data
             if (demux_done) break;
             const packet = mpeg.demux.decode() orelse {
                 demux_done = true;
@@ -226,6 +253,24 @@ pub fn main() !void {
         }
     }
 
-    std.debug.print("frames hashed: {d}\n", .{frames_hashed});
-    std.debug.print("{x:0>16}\n", .{hash});
+    std.debug.print("Playback complete. Total frames: {d}\n", .{frame_count});
+}
+
+fn calculateAspectRatioRect(window_w: i32, window_h: i32, texture_w: i32, texture_h: i32) sdl.Rectangle {
+    const window_aspect = @as(f32, @floatFromInt(window_w)) / @as(f32, @floatFromInt(window_h));
+    const texture_aspect = @as(f32, @floatFromInt(texture_w)) / @as(f32, @floatFromInt(texture_h));
+
+    var dest_rect: sdl.Rectangle = undefined;
+    if (window_aspect > texture_aspect) {
+        dest_rect.height = window_h;
+        dest_rect.width = @intFromFloat(@as(f32, @floatFromInt(window_h)) * texture_aspect);
+        dest_rect.x = @divExact(window_w - dest_rect.width, 2);
+        dest_rect.y = 0;
+    } else {
+        dest_rect.width = window_w;
+        dest_rect.height = @intFromFloat(@as(f32, @floatFromInt(window_w)) / texture_aspect);
+        dest_rect.x = 0;
+        dest_rect.y = @divExact(window_h - dest_rect.height, 2);
+    }
+    return dest_rect;
 }

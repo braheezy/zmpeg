@@ -1,8 +1,11 @@
 const std = @import("std");
+const sdl = @import("sdl");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+
+    const sdk = sdl.init(b, .{});
 
     const mod = b.addModule("zmpeg", .{
         .root_source_file = b.path("src/root.zig"),
@@ -20,6 +23,9 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
+
+    exe.root_module.addImport("sdl2", sdk.getWrapperModule());
+    sdk.link(exe, .static, sdl.Library.SDL2);
 
     b.installArtifact(exe);
 
