@@ -95,7 +95,11 @@ pub fn deinit(self: *BitReader) void {
 // Bit-level operations
 pub fn has(self: *BitReader, bit_count: usize) !bool {
     const available_bytes = if (self.reader.end >= self.reader.seek) self.reader.end - self.reader.seek else return false;
-    const available_bits = (@as(usize, available_bytes) << 3) - self.bit_index;
+    const total_bits = @as(usize, available_bytes) << 3;
+
+    // Guard against underflow if bit_index exceeds available bits
+    if (self.bit_index > total_bits) return false;
+    const available_bits = total_bits - self.bit_index;
 
     if (available_bits >= bit_count) return true;
 
@@ -110,7 +114,9 @@ pub fn has(self: *BitReader, bit_count: usize) !bool {
     };
 
     const new_available_bytes = self.reader.end - self.reader.seek;
-    const new_available_bits = (new_available_bytes << 3) - self.bit_index;
+    const new_total_bits = new_available_bytes << 3;
+    if (self.bit_index > new_total_bits) return false;
+    const new_available_bits = new_total_bits - self.bit_index;
     if (new_available_bits >= bit_count) return true;
 
     if (self.file != null and new_available_bytes == available_bytes) {

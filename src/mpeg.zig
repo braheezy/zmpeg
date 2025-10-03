@@ -3,6 +3,7 @@ const demux_mod = @import("demux.zig");
 const BitReader = @import("bitreader.zig").BitReader;
 const Demux = demux_mod.Demux;
 const Video = @import("video.zig").Video;
+const Audio = @import("audio.zig").Audio;
 const types = @import("types.zig");
 const PacketType = types.PacketType;
 
@@ -25,6 +26,8 @@ pub const Mpeg = struct {
     audio_enabled: bool = true,
     audio_packet_type: ?PacketType = null,
     audio_stream_index: u8 = 0,
+    audio_decoder: ?*Audio = null,
+    audio_reader: ?*BitReader = null,
 
     pub fn init(allocator: std.mem.Allocator, reader: *BitReader) !*Mpeg {
         const self = try allocator.create(Mpeg);
@@ -50,6 +53,14 @@ pub const Mpeg = struct {
             self.allocator.destroy(reader);
         }
         self.video_reader = null;
+        if (self.audio_decoder) |decoder| {
+            decoder.deinit(self.allocator);
+        }
+        if (self.audio_reader) |reader| {
+            reader.deinit();
+            self.allocator.destroy(reader);
+        }
+        self.audio_reader = null;
         if (self.owns_source_reader) {
             self.source_reader.deinit();
             self.allocator.destroy(self.source_reader);
@@ -65,7 +76,11 @@ pub const Mpeg = struct {
             return;
         }
 
-        // self.audio_packet_type =
+        if (self.demux.getNumAudioStreams() > 0) {
+            const base: u8 = @intFromEnum(PacketType.audio1);
+            const idx: u8 = base + self.audio_stream_index;
+            self.audio_packet_type = @enumFromInt(idx);
+        }
     }
 
     pub fn getWidth(self: *Mpeg) i32 {
@@ -114,19 +129,19 @@ pub const Mpeg = struct {
                 const base: u8 = @intFromEnum(PacketType.audio1);
                 const idx: u8 = base + self.audio_stream_index;
                 self.audio_packet_type = @enumFromInt(idx);
+
+                if (self.audio_decoder == null) {
+                    self.audio_reader = try self.allocator.create(BitReader);
+                    self.audio_reader.?.* = BitReader.initAppend(self.allocator, 1024) catch return false;
+                    self.audio_decoder = try Audio.init(
+                        self.allocator,
+                        self.audio_reader.?,
+                        true, // Use interleaved format for SDL
+                    );
+                }
             } else {
                 self.audio_packet_type = null;
             }
-
-            // if (self.audio_decoder == null) {
-            // self.audio_buffer = try self.allocator.alloc(u8, DEFAULT_BUFFER_SIZE);
-            // self.audio_reader = BitReader.initFromMemory(self.allocator, self.audio_buffer.?);
-            // self.audio_decoder = try Audio.init(
-            //     self.allocator,
-            //     &self.audio_reader,
-            //     true,
-            // );
-            // }
         }
 
         self.has_decoders = true;

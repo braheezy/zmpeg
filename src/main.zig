@@ -46,6 +46,8 @@ fn frameToBgr(frame: *const zmpeg.Frame, dest: []u8, row_stride: usize) void {
 
         var col: usize = 0;
         while (col < cols) : (col += 1) {
+            if (c_index >= cr_data.len or c_index >= cb_data.len) break;
+
             const cr = @as(i32, cr_data[c_index]) - 128;
             const cb = @as(i32, cb_data[c_index]) - 128;
             const r = (cr * 104_597) >> 16;
@@ -116,20 +118,25 @@ pub fn main() !void {
     defer std.process.argsFree(allocator, args);
 
     var input_path: []const u8 = "trouble-pogo-5s.mpg";
+    var test_audio_packets: ?usize = null;
 
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         const arg = args[i];
         if (arg.len > 0 and arg[0] != '-') {
             input_path = arg;
+        } else if (std.mem.startsWith(u8, arg, "--test-audio=")) {
+            const num_str = arg["--test-audio=".len..];
+            test_audio_packets = std.fmt.parseInt(usize, num_str, 10) catch {
+                std.debug.print("Invalid number for --test-audio\n", .{});
+                return error.InvalidArgument;
+            };
         }
     }
 
     // Initialize MPEG decoder
     var mpeg = try zmpeg.createFromFile(allocator, input_path);
     defer mpeg.deinit();
-
-    mpeg.setAudio(false);
 
     const width = mpeg.getWidth();
     const height = mpeg.getHeight();
@@ -139,52 +146,58 @@ pub fn main() !void {
 
     // Initialize SDL
     try sdl.init(.{
-        .video = true,
+        .video = test_audio_packets == null,
+        .audio = true,
     });
     defer sdl.quit();
 
-    // Create window
+    // Skip SDL resources in test mode
     const window_width = 800;
     const window_height = 600;
 
-    const window = try sdl.createWindow(
+    const window = if (test_audio_packets == null) try sdl.createWindow(
         "ZMPEG Video Player",
         .centered,
         .centered,
         window_width,
         window_height,
         .{},
-    );
-    defer window.destroy();
+    ) else undefined;
+    defer if (test_audio_packets == null) window.destroy();
 
     // Create renderer
-    const renderer = try sdl.createRenderer(window, null, .{
+    const renderer = if (test_audio_packets == null) try sdl.createRenderer(window, null, .{
         .accelerated = true,
         .present_vsync = true,
-    });
-    defer renderer.destroy();
+    }) else undefined;
+    defer if (test_audio_packets == null) renderer.destroy();
 
     // Create SDL texture for video frames
-    const texture = try sdl.createTexture(
+    const texture = if (test_audio_packets == null) try sdl.createTexture(
         renderer,
         .rgb24,
         .streaming,
         @intCast(width),
         @intCast(height),
-    );
-    defer texture.destroy();
+    ) else undefined;
+    defer if (test_audio_packets == null) texture.destroy();
 
     // Calculate destination rectangle to maintain aspect ratio
-    const dest_rect = calculateAspectRatioRect(window_width, window_height, @intCast(width), @intCast(height));
+    const dest_rect = if (test_audio_packets == null) calculateAspectRatioRect(window_width, window_height, @intCast(width), @intCast(height)) else undefined;
 
     // Frame buffer for BGR conversion
     const row_stride = @as(usize, @intCast(width)) * 3;
     const frame_size = @as(usize, @intCast(height)) * row_stride;
-    const frame_buffer = try allocator.alloc(u8, frame_size);
-    defer allocator.free(frame_buffer);
+    var dummy_buffer: [1]u8 = .{0};
+    const frame_buffer = if (test_audio_packets == null) try allocator.alloc(u8, frame_size) else dummy_buffer[0..];
+    defer if (test_audio_packets == null) allocator.free(frame_buffer);
+
+    // Audio device will be initialized once we decode the first audio header
+    var audio_device: ?sdl.AudioDevice = null;
+    defer if (audio_device) |device| device.close();
 
     var running = true;
-    var frame_count: usize = 0;
+    var audio_packet_count: usize = 0;
 
     if (mpeg.video_decoder) |video_decoder| {
         const video_reader = mpeg.video_reader;
@@ -193,46 +206,49 @@ pub fn main() !void {
         var demux_done = false;
 
         while (running) {
-            // Handle events
-            while (sdl.pollEvent()) |ev| {
-                switch (ev) {
-                    .quit => running = false,
-                    .key_down => |key| {
-                        if (key.scancode == .escape) {
-                            running = false;
-                        }
-                    },
-                    else => {},
+            // Handle events (skip in test mode)
+            if (test_audio_packets == null) {
+                while (sdl.pollEvent()) |ev| {
+                    switch (ev) {
+                        .quit => running = false,
+                        .key_down => |key| {
+                            if (key.scancode == .escape) {
+                                running = false;
+                            }
+                        },
+                        else => {},
+                    }
                 }
             }
 
-            // Try to decode a frame
+            // Try to decode a frame (skip rendering in test mode)
             if (video_decoder.decode()) |frame| {
-                // Convert frame to BGR
-                const frame_view: *const zmpeg.Frame = @ptrCast(frame);
-                frameToBgr(frame_view, frame_buffer, row_stride);
+                if (test_audio_packets == null) {
+                    // Convert frame to BGR
+                    const frame_view: *const zmpeg.Frame = @ptrCast(frame);
+                    frameToBgr(frame_view, frame_buffer, row_stride);
 
-                // Update SDL texture with frame data
-                try texture.update(frame_buffer, row_stride, null);
+                    // Update SDL texture with frame data
+                    try texture.update(frame_buffer, row_stride, null);
 
-                // Clear screen
-                try renderer.setColorRGB(0, 0, 0);
-                try renderer.clear();
+                    // Clear screen
+                    try renderer.setColorRGB(0, 0, 0);
+                    try renderer.clear();
 
-                // Render the texture
-                try renderer.copy(texture, null, dest_rect);
-                renderer.present();
+                    // Render the texture
+                    try renderer.copy(texture, null, dest_rect);
+                    renderer.present();
 
-                frame_count += 1;
-                std.debug.print("Frame {d} displayed\n", .{frame_count});
-
-                // Small delay to control playback speed (roughly 25 FPS)
-                sdl.delay(40);
+                    // Small delay to control playback speed (roughly 25 FPS)
+                    sdl.delay(40);
+                }
                 continue;
             }
 
             // If no frame available, try to get more data
-            if (demux_done) break;
+            if (demux_done) {
+                continue;
+            }
             const packet = mpeg.demux.decode() orelse {
                 demux_done = true;
                 if (video_reader) |reader| {
@@ -250,10 +266,117 @@ pub fn main() !void {
                     }
                 }
             }
+
+            // Handle audio packets
+            if (mpeg.audio_packet_type) |aptype| {
+                if (packet.type == aptype) {
+                    if (mpeg.audio_reader) |reader| {
+                        reader.append(packet.data) catch break;
+
+                        // Decode available audio frames
+                        if (mpeg.audio_decoder) |audio_decoder| {
+                            const is_test_mode = test_audio_packets != null;
+
+                            // Initialize audio device once we have a sample rate (skip in test mode)
+                            if (audio_device == null and !is_test_mode) {
+                                const sample_rate = audio_decoder.getSamplerate();
+                                if (sample_rate > 0) {
+                                    std.debug.print("Opening SDL audio: {d} Hz\n", .{sample_rate});
+                                    const result = sdl.openAudioDevice(.{
+                                        .desired_spec = .{
+                                            .sample_rate = @intCast(sample_rate),
+                                            .buffer_format = sdl.AudioFormat.f32,
+                                            .channel_count = 2,
+                                            .buffer_size_in_frames = 4096,
+                                            .callback = null,
+                                            .userdata = null,
+                                        },
+                                    }) catch |err| {
+                                        std.debug.print("Failed to open audio device: {}\n", .{err});
+                                        break;
+                                    };
+                                    audio_device = result.device;
+                                    std.debug.print("SDL audio device opened successfully!\n", .{});
+                                    std.debug.print("  Requested: {d} Hz, f32, 2 channels\n", .{sample_rate});
+                                    std.debug.print("  Got:       {d} Hz, {any}, {d} channels\n", .{
+                                        result.obtained_spec.sample_rate,
+                                        result.obtained_spec.buffer_format,
+                                        result.obtained_spec.channel_count,
+                                    });
+                                    audio_device.?.pause(false);
+                                    std.debug.print("SDL audio UNPAUSED - should be playing now!\n", .{});
+                                }
+                            }
+
+                            var frames_decoded_this_packet: usize = 0;
+                            var decode_attempts: usize = 0;
+                            while (decode_attempts < 10) : (decode_attempts += 1) {
+                                const samples = audio_decoder.decode() catch |err| {
+                                    std.debug.print("Audio decode error: {}\n", .{err});
+                                    break;
+                                };
+                                if (samples) |s| {
+                                    frames_decoded_this_packet += 1;
+                                    // In test mode, hash and print
+                                    if (is_test_mode) {
+                                        const sample_bytes = std.mem.sliceAsBytes(s.interleaved[0..]);
+                                        const packet_hash = hashFrame(fnv_offset_basis, sample_bytes);
+                                        std.debug.print("Zig audio packet {d} time={d:.6} hash={x:0>16}\n", .{ audio_packet_count, s.time, packet_hash });
+                                        audio_packet_count += 1;
+
+                                        if (audio_packet_count >= test_audio_packets.?) {
+                                            std.debug.print("audio packets decoded: {d}\n", .{audio_packet_count});
+                                            return;
+                                        }
+                                    } else {
+                                        // Queue audio samples to SDL
+                                        if (audio_device) |device| {
+                                            const sample_count = @as(usize, s.count) * 2;
+                                            const active_samples = s.interleaved[0..sample_count];
+                                            var max_val: f32 = 0;
+                                            for (active_samples) |sample| {
+                                                const abs_val = @abs(sample);
+                                                if (abs_val > max_val) max_val = abs_val;
+                                            }
+                                            if (frames_decoded_this_packet <= 3 or max_val > 0.01) {
+                                                std.debug.print("Frame {d}: max={d:.6}, samples=[{d:.3}, {d:.3}, {d:.3}, {d:.3}]\n", .{
+                                                    frames_decoded_this_packet,
+                                                    max_val,
+                                                    active_samples[0],
+                                                    active_samples[1],
+                                                    active_samples[2],
+                                                    active_samples[3],
+                                                });
+                                            }
+
+                                            const sample_bytes = std.mem.sliceAsBytes(active_samples);
+                                            const queue_before = device.getQueuedAudioSize();
+                                            device.queueAudio(sample_bytes) catch |err| {
+                                                std.debug.print("Failed to queue audio: {}\n", .{err});
+                                            };
+                                            const queue_after = device.getQueuedAudioSize();
+                                            if (frames_decoded_this_packet <= 3 or max_val > 0.01) {
+                                                std.debug.print("  Queued to SDL: {d} -> {d} bytes\n", .{ queue_before, queue_after });
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    break;
+                                }
+                            }
+                            if (!is_test_mode and frames_decoded_this_packet > 0) {
+                                std.debug.print("Decoded {d} audio frames from packet\n", .{frames_decoded_this_packet});
+                            }
+                            // Discard consumed audio data
+                            reader.discardReadBytes();
+                        }
+                    }
+                }
+            }
         }
     }
 
-    std.debug.print("Playback complete. Total frames: {d}\n", .{frame_count});
+    std.debug.print("Playback complete.\n", .{});
 }
 
 fn calculateAspectRatioRect(window_w: i32, window_h: i32, texture_w: i32, texture_h: i32) sdl.Rectangle {

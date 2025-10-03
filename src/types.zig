@@ -29,9 +29,9 @@ pub const SAMPLES_PER_FRAME = 1152;
 pub const Samples = struct {
     time: f64,
     count: u32,
-    left: ?[]const f32 = null,
-    right: ?[]const f32 = null,
-    interleaved: ?[]const f32 = null,
+    left: [SAMPLES_PER_FRAME]f32 = undefined,
+    right: [SAMPLES_PER_FRAME]f32 = undefined,
+    interleaved: [SAMPLES_PER_FRAME * 2]f32 = undefined,
 };
 
 pub const PacketType = enum(i32) {
