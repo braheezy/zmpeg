@@ -187,22 +187,29 @@ const AudioOutput = struct {
     allocator: std.mem.Allocator,
     device: sdl.AudioDevice,
     spec: sdl.AudioSpecResponse,
-    start_threshold: usize,
+    start_threshold_bytes: usize,
+    min_queue_bytes: usize,
     started: bool = false,
 
     fn deinit(self: *AudioOutput) void {
         self.device.close();
     }
 
-    fn queue(self: *AudioOutput, samples: *const zmpeg.Samples) !void {
+    fn queue(self: *AudioOutput, samples: *const zmpeg.Samples) !usize {
         const expected_channels: usize = 2;
         const sample_count: usize = @intCast(samples.count);
         const source = std.mem.sliceAsBytes(samples.interleaved[0 .. sample_count * expected_channels]);
         try self.device.queueAudio(source);
-        if (!self.started and self.device.getQueuedAudioSize() >= self.start_threshold) {
+        const queued = self.device.getQueuedAudioSize();
+        if (!self.started and queued >= self.start_threshold_bytes) {
             self.device.pause(false);
             self.started = true;
         }
+        return queued;
+    }
+
+    fn needsMoreAudio(self: *AudioOutput) bool {
+        return self.device.getQueuedAudioSize() < self.min_queue_bytes;
     }
 };
 
@@ -237,15 +244,18 @@ fn initAudioOutput(allocator: std.mem.Allocator, sample_rate: u32) !AudioOutput 
         .allocator = allocator,
         .device = result.device,
         .spec = result.obtained_spec,
-        .start_threshold = 0,
+        .start_threshold_bytes = 0,
+        .min_queue_bytes = 0,
     };
 
     errdefer output.deinit();
 
     const channels = @as(usize, result.obtained_spec.channel_count);
     const bytes_per_sample = bytesPerSample(result.obtained_spec.buffer_format);
-    const frames = @as(usize, @max(result.obtained_spec.buffer_size_in_frames, 2048));
-    output.start_threshold = frames * channels * bytes_per_sample;
+    const frame_bytes: usize = zmpeg.SAMPLES_PER_FRAME * 2 * @sizeOf(f32);
+    output.start_threshold_bytes = frame_bytes * 2; // about 46ms at 44.1k
+    const base_frames = @as(usize, @max(result.obtained_spec.buffer_size_in_frames, 2048));
+    output.min_queue_bytes = @max(frame_bytes * 4, base_frames * channels * bytes_per_sample);
 
     output.device.pause(true);
 
@@ -271,6 +281,8 @@ pub fn main() !void {
     var test_audio_packets: ?usize = null;
     var run_test_pattern = false;
     var audio_dump_path: ?[]const u8 = null;
+    var capture_audio_frame: ?usize = null;
+    var capture_audio_prefix: ?[]const u8 = null;
 
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
@@ -285,6 +297,14 @@ pub fn main() !void {
             };
         } else if (std.mem.startsWith(u8, arg, "--dump-audio=")) {
             audio_dump_path = arg["--dump-audio=".len..];
+        } else if (std.mem.startsWith(u8, arg, "--capture-audio-frame=")) {
+            const num_str = arg["--capture-audio-frame=".len..];
+            capture_audio_frame = std.fmt.parseInt(usize, num_str, 10) catch {
+                std.debug.print("Invalid number for --capture-audio-frame\n", .{});
+                return error.InvalidArgument;
+            };
+        } else if (std.mem.startsWith(u8, arg, "--capture-audio-prefix=")) {
+            capture_audio_prefix = arg["--capture-audio-prefix=".len..];
         } else if (std.mem.eql(u8, arg, "--test-pattern")) {
             run_test_pattern = true;
         }
@@ -298,6 +318,15 @@ pub fn main() !void {
     // Initialize MPEG decoder
     var mpeg = try zmpeg.createFromFile(allocator, input_path);
     defer mpeg.deinit();
+
+    if (capture_audio_frame != null and capture_audio_prefix != null) {
+        if (mpeg.audio_decoder) |decoder| {
+            decoder.setDebugCapture(.{
+                .frame_index = capture_audio_frame.?,
+                .prefix = capture_audio_prefix.?,
+            });
+        }
+    }
 
     const width = mpeg.getWidth();
     const height = mpeg.getHeight();
@@ -441,24 +470,26 @@ pub fn main() !void {
 
         var demux_done = false;
 
-        while (running) {
-            // Handle events (skip in test mode)
-            if (test_audio_packets == null) {
-                while (sdl.pollEvent()) |ev| {
-                    switch (ev) {
-                        .quit => running = false,
+    while (running) {
+        // Handle events (skip in test mode)
+        if (test_audio_packets == null) {
+            while (sdl.pollEvent()) |ev| {
+                switch (ev) {
+                    .quit => running = false,
                         .key_down => |key| {
                             if (key.scancode == .escape) {
                                 running = false;
                             }
                         },
                         else => {},
-                    }
                 }
             }
+        }
 
-            // Try to decode a frame (skip rendering in test mode)
-            const maybe_frame = video_decoder.decode();
+        const audio_queue_low = if (audio_output) |*output| output.needsMoreAudio() else false;
+
+        // Try to decode a frame (skip rendering in test mode)
+        const maybe_frame = if (!audio_queue_low) video_decoder.decode() else null;
             if (need_video) {
                 if (maybe_frame) |frame| {
                     if (test_audio_packets == null) {
@@ -572,10 +603,9 @@ pub fn main() !void {
 
                         renderer.present();
                     }
-                    continue;
                 }
             } else if (maybe_frame != null) {
-                continue;
+                // frame decoded but we do not need to present; allow audio/demux handling
             }
 
             // If no frame available, try to get more data
@@ -627,6 +657,7 @@ pub fn main() !void {
                                 }
                             }
 
+                            var need_more_audio = false;
                             while (true) {
                                 const maybe_samples = audio_decoder.decode() catch |err| {
                                     std.debug.print("Audio decode error: {}\n", .{err});
@@ -640,9 +671,12 @@ pub fn main() !void {
                                         };
                                     }
                                     if (audio_output) |*output| {
-                                        output.queue(samples) catch |err| {
+                                        _ = output.queue(samples) catch |err| {
                                             std.debug.print("Failed to queue audio: {}\n", .{err});
                                         };
+                                        if (audio_dump_path == null) {
+                                            need_more_audio = output.needsMoreAudio();
+                                        }
                                     }
                                     if (test_audio_packets != null) {
                                         const sample_bytes = std.mem.sliceAsBytes(samples.interleaved[0 .. samples.count * 2]);
@@ -658,11 +692,15 @@ pub fn main() !void {
                             }
 
                             reader.discardReadBytes();
+                            if (need_more_audio) {
+                                continue;
+                            }
                         }
                     }
                 }
             }
         }
+
     }
 
     std.debug.print("Playback complete.\n", .{});

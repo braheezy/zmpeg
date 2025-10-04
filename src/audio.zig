@@ -4,6 +4,11 @@ const tables = @import("tables.zig");
 const BitReader = @import("bitreader.zig").BitReader;
 const types = @import("types.zig");
 
+pub const DebugCapture = struct {
+    frame_index: usize,
+    prefix: []const u8,
+};
+
 pub const Audio = struct {
     allocator: std.mem.Allocator,
     time: f64 = 0,
@@ -14,7 +19,7 @@ pub const Audio = struct {
     layer: u8 = 0,
     mode: u8 = 0,
     bound: u8 = 0,
-    v_pos: u16 = 0,
+    v_pos: i32 = 0,
     next_frame_data_size: u32 = 0,
     has_header: bool = false,
     use_interleaved: bool = false,
@@ -31,6 +36,8 @@ pub const Audio = struct {
     V: [2][1024]f32 = undefined,
     U: [32]f32 = undefined,
 
+    debug_capture: ?DebugCapture = null,
+
     pub fn init(allocator: std.mem.Allocator, reader: *BitReader, use_interleaved: bool) !*Audio {
         const self = try allocator.create(Audio);
         self.* = .{
@@ -45,6 +52,7 @@ pub const Audio = struct {
             .V = undefined,
             .U = undefined,
             .use_interleaved = use_interleaved,
+            .debug_capture = null,
         };
         self.samples.count = types.SAMPLES_PER_FRAME;
         @memcpy(self.D[0..512], tables.synthesis_window[0..512]);
@@ -53,8 +61,24 @@ pub const Audio = struct {
             @memset(row, @as(f32, 0.0));
         }
         @memset(&self.U, @as(f32, 0.0));
+        for (&self.allocation) |*chan| {
+            for (chan) |*entry| entry.* = null;
+        }
+        for (&self.scale_factor_info) |*row| {
+            @memset(row, @as(u8, 0));
+        }
+        for (&self.scale_factor) |*chan| {
+            for (chan) |*sb| @memset(sb, @as(i32, 0));
+        }
+        for (&self.sample) |*chan| {
+            for (chan) |*sb| @memset(sb, @as(i32, 0));
+        }
 
         return self;
+    }
+
+    pub fn setDebugCapture(self: *Audio, capture: ?DebugCapture) void {
+        self.debug_capture = capture;
     }
 
     pub fn deinit(self: *Audio, allocator: std.mem.Allocator) void {
@@ -185,6 +209,7 @@ pub const Audio = struct {
     }
 
     fn decodeFrame(self: *Audio) !void {
+        const frame_index: usize = @intCast(self.samples_decoded / types.SAMPLES_PER_FRAME);
         // Prepare the quantizer table lookups
         const tab1: u8 = if (self.mode == mode_mono) 0 else 1;
         const tab2 = tables.quant_lut_step_1[tab1][self.bitrate_index];
@@ -264,7 +289,7 @@ pub const Audio = struct {
         // Coefficient input and reconstruction
         var out_pos: usize = 0;
         for (0..3) |part| {
-            for (0..4) |_| {
+            for (0..4) |block| {
                 // read the samples
                 for (0..self.bound) |b| {
                     try self.readSamples(0, @intCast(b), @intCast(part));
@@ -290,19 +315,29 @@ pub const Audio = struct {
                 // Synthesis loop
                 for (0..3) |p| {
                     // Shifting step
-                    self.v_pos = @intCast((@as(u16, @intCast(self.v_pos)) -% 64) & 1023);
+                    self.v_pos = (self.v_pos - 64) & 1023;
 
                     for (0..2) |ch| {
-                        idct36(self.sample[ch], @intCast(p), &self.V[ch], @intCast(self.v_pos));
+                        if (self.debug_capture) |cfg| {
+                            if (frame_index == cfg.frame_index) {
+                                std.debug.print(
+                                    "zig v_pos part={d} block={d} p={d} ch={d} -> {d}\n",
+                                    .{ part, block, p, ch, self.v_pos },
+                                );
+                            }
+                        }
+
+                        idct36(self.sample[ch], @intCast(p), self.V[ch][0..], @intCast(self.v_pos));
 
                         // Build U, windowing, calculate output
                         @memset(&self.U, 0);
 
-                        var d_index = 512 - (@as(u16, @intCast(self.v_pos)) >> 1);
-                        var v_index = (self.v_pos % 128) >> 1;
+                        var d_index: i32 = 512 - (self.v_pos >> 1);
+                        var v_index: i32 = (@mod(self.v_pos, 128)) >> 1;
                         while (v_index < 1024) {
                             for (0..32) |i| {
-                                self.U[i] += self.D[d_index] * self.V[ch][v_index];
+                                const accum = @as(f64, self.U[i]) + @as(f64, self.D[@intCast(d_index)]) * @as(f64, self.V[ch][@intCast(v_index)]);
+                                self.U[i] = @floatCast(accum);
                                 d_index += 1;
                                 v_index += 1;
                             }
@@ -315,7 +350,8 @@ pub const Audio = struct {
                         v_index = (128 - 32 + 1024) - v_index;
                         while (v_index < 1024) {
                             for (0..32) |i| {
-                                self.U[i] += self.D[d_index] * self.V[ch][v_index];
+                                const accum = @as(f64, self.U[i]) + @as(f64, self.D[@intCast(d_index)]) * @as(f64, self.V[ch][@intCast(v_index)]);
+                                self.U[i] = @floatCast(accum);
                                 d_index += 1;
                                 v_index += 1;
                             }
@@ -338,6 +374,14 @@ pub const Audio = struct {
                     out_pos += 32;
                 } // End of synthesis sub-block loop
             } // Decoding of the granule finished
+        }
+
+        if (self.debug_capture) |cfg| {
+            if (frame_index == cfg.frame_index) {
+                self.dumpDebugState(cfg) catch |err| {
+                    std.debug.print("Audio debug dump failed: {}\n", .{err});
+                };
+            }
         }
 
         self.reader.alignToByte();
@@ -430,6 +474,39 @@ pub const Audio = struct {
             sample[2] = 0;
             return;
         }
+    }
+
+    fn dumpDebugState(self: *Audio, config: DebugCapture) !void {
+        var path_buf: [256]u8 = undefined;
+        const path = try std.fmt.bufPrint(&path_buf, "{s}_frame.bin", .{config.prefix});
+        var file = try std.fs.cwd().createFile(path, .{ .truncate = true });
+        defer file.close();
+
+        for (0..2) |ch| {
+            for (0..32) |sb| {
+                if (self.allocation[ch][sb]) |q| {
+                    var buf_levels: [2]u8 = undefined;
+                    std.mem.writeInt(u16, &buf_levels, q.levels, .little);
+                    try file.writeAll(&buf_levels);
+                    try file.writeAll(&[_]u8{q.group});
+                    try file.writeAll(&[_]u8{q.bits});
+                } else {
+                    const zero16: [2]u8 = .{ 0, 0 };
+                    try file.writeAll(&zero16);
+                    try file.writeAll(&[_]u8{0});
+                    try file.writeAll(&[_]u8{0});
+                }
+            }
+        }
+
+        try file.writeAll(std.mem.asBytes(&self.scale_factor_info));
+        try file.writeAll(std.mem.asBytes(&self.scale_factor));
+        try file.writeAll(std.mem.asBytes(&self.sample));
+        try file.writeAll(std.mem.asBytes(&self.V));
+        try file.writeAll(std.mem.asBytes(&self.U));
+
+        const v_pos_i32: i32 = self.v_pos;
+        try file.writeAll(std.mem.asBytes(&v_pos_i32));
     }
 };
 
@@ -727,6 +804,7 @@ fn idct36(s: [32][3]i32, ss: u32, d: []f32, dp: i32) void {
     d[base + 62] = -t09;
     d[base + 34] = -t09;
     d[base + 63] = -t14;
+    d[base + 33] = -t14;
 
     d[base + 32] = -t05;
     d[base + 0] = t05;
