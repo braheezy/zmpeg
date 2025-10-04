@@ -47,8 +47,12 @@ pub const Audio = struct {
             .use_interleaved = use_interleaved,
         };
         self.samples.count = types.SAMPLES_PER_FRAME;
-        @memcpy(self.D[0..512], tables.synthesis_window[0..]);
-        @memcpy(self.D[512..], tables.synthesis_window[0..]);
+        @memcpy(self.D[0..512], tables.synthesis_window[0..512]);
+        @memcpy(self.D[512..], tables.synthesis_window[0..512]);
+        for (&self.V) |*row| {
+            @memset(row, @as(f32, 0.0));
+        }
+        @memset(&self.U, @as(f32, 0.0));
 
         return self;
     }
@@ -106,7 +110,7 @@ pub const Audio = struct {
     }
 
     pub fn setTime(self: *Audio, time: f64) void {
-        self.samples_decoded = @intCast(time * @as(f64, @floatFromInt(sample_rates[self.samplerate_index])));
+        self.samples_decoded = @intCast(time * @as(f64, intToF32(sample_rates[self.samplerate_index])));
         self.time = time;
     }
 
@@ -119,7 +123,7 @@ pub const Audio = struct {
             return 0;
         }
 
-        self.reader.skip(0x00);
+        _ = self.reader.skipBytes(0x00) catch 0;
         const sync = self.reader.readBits(11) catch return 0;
 
         // Attempt to resync if no syncword was found. This sucks balls. The MP2
@@ -200,8 +204,9 @@ pub const Audio = struct {
 
         var sb = self.bound;
         while (sb < sblimit) : (sb += 1) {
-            self.allocation[0][sb] = try self.readAllocation(@intCast(sb), tab3);
-            self.allocation[1][sb] = try self.readAllocation(@intCast(sb), tab3);
+            const alloc = try self.readAllocation(@intCast(sb), tab3);
+            self.allocation[0][sb] = alloc;
+            self.allocation[1][sb] = alloc;
         }
 
         // Read the scale factor selector information
@@ -239,11 +244,11 @@ pub const Audio = struct {
                             sf[1] = val;
                             sf[2] = val;
                         },
-                        3 => {
-                            sf[0] = @intCast(try self.reader.readBits(6));
-                            const val = try self.reader.readBits(6);
-                            sf[1] = @intCast(val);
-                            sf[2] = @intCast(try self.reader.readBits(6));
+                       3 => {
+                           sf[0] = @intCast(try self.reader.readBits(6));
+                            const val: i32 = @intCast(try self.reader.readBits(6));
+                            sf[1] = val;
+                            sf[2] = val;
                         },
                         else => {},
                     }
@@ -339,14 +344,22 @@ pub const Audio = struct {
     }
 
     fn findFrameSync(self: *Audio) bool {
-        var i: usize = self.reader.reader.buffer.len >> 3;
-        while (i < self.reader.reader.buffer.len - 1) : (i += 1) {
-            if (self.reader.reader.buffer[i] == 0xFF and self.reader.reader.buffer[i + 1] == 0xFE) {
-                self.reader.bit_index = (i + 1) << 3 + 3;
+        var i = self.reader.reader.seek;
+        const end = self.reader.reader.end;
+
+        while (i + 1 < end) : (i += 1) {
+            const b0 = self.reader.reader.buffer[i];
+            const b1 = self.reader.reader.buffer[i + 1];
+            if (b0 == 0xFF and (b1 & 0xFE) == 0xFC) {
+                self.reader.reader.seek = i + 1;
+                self.reader.bit_index = 3;
                 return true;
             }
         }
-        self.reader.bit_index = (i + 1) << 3;
+
+        const clamped = @min(i + 1, end);
+        self.reader.reader.seek = clamped;
+        self.reader.bit_index = 0;
         return false;
     }
 
@@ -420,10 +433,13 @@ pub const Audio = struct {
                 }
             }
 
-            // Debug first decode
-            if (self.samples_decoded == 0 and ch == 0 and sb < 2) {
-                std.debug.print("Before dequant ch={d} sb={d}: sample=[{d},{d},{d}] sf={d} adj={d} bits={d} group={d}\n", .{ ch, sb, sample[0], sample[1], sample[2], sf, adj, q.bits, q.group });
-            }
+            // Debug first decode and track amplitudes
+            const pre0 = sample[0];
+            const pre1 = sample[1];
+            const pre2 = sample[2];
+            _ = pre0;
+            _ = pre1;
+            _ = pre2;
 
             // Postmultiply samples
             const scale = @divTrunc(65536, adj + 1);
@@ -437,11 +453,6 @@ pub const Audio = struct {
 
             val = (adj - sample[2]) * scale;
             sample[2] = (val * (sf >> 12) + ((val * (sf & 4095) + 2048) >> 12)) >> 12;
-
-            // Debug after dequant
-            if (self.samples_decoded == 0 and ch == 0 and sb < 2) {
-                std.debug.print("After dequant ch={d} sb={d}: sample=[{d},{d},{d}]\n", .{ ch, sb, sample[0], sample[1], sample[2] });
-            }
         } else {
             // No bits allocated for this subband
             sample[0] = 0;
@@ -482,116 +493,128 @@ const bit_rates = [_]i16{
     8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160, // MPEG-2
 };
 
+inline fn intToF32(value: i32) f32 {
+    return @as(f32, @floatFromInt(value));
+}
+
+inline fn f32c(value: f64) f32 {
+    return @floatCast(value);
+}
+
 const scale_factor_base = [_]i32{ 0x02000000, 0x01965FEA, 0x01428A30 };
 
 fn idct36(s: [32][3]i32, ss: u32, d: []f32, dp: i32) void {
-    var t01 = s[0][ss] + s[31][ss];
-    var t02 = @as(f32, @floatFromInt(s[0][ss] - s[31][ss])) * 0.500602998235;
-    var t03 = (s[1][ss] + s[30][ss]);
-    var t04 = @as(f32, @floatFromInt(s[1][ss] - s[30][ss])) * 0.505470959898;
-    var t05 = (s[2][ss] + s[29][ss]);
-    var t06 = @as(f32, @floatFromInt(s[2][ss] - s[29][ss])) * 0.515447309923;
-    var t07 = (s[3][ss] + s[28][ss]);
-    var t08 = @as(f32, @floatFromInt(s[3][ss] - s[28][ss])) * 0.53104259109;
-    var t09 = (s[4][ss] + s[27][ss]);
-    var t10 = @as(f32, @floatFromInt(s[4][ss] - s[27][ss])) * 0.553103896034;
-    var t11 = (s[5][ss] + s[26][ss]);
-    var t12 = @as(f32, @floatFromInt(s[5][ss] - s[26][ss])) * 0.582934968206;
-    var t13 = (s[6][ss] + s[25][ss]);
-    var t14 = @as(f32, @floatFromInt(s[6][ss] - s[25][ss])) * 0.622504123036;
-    var t15 = (s[7][ss] + s[24][ss]);
-    var t16 = @as(f32, @floatFromInt(s[7][ss] - s[24][ss])) * 0.674808341455;
-    var t17 = (s[8][ss] + s[23][ss]);
-    var t18 = @as(f32, @floatFromInt(s[8][ss] - s[23][ss])) * 0.744536271002;
-    var t19 = (s[9][ss] + s[22][ss]);
-    var t20 = @as(f32, @floatFromInt(s[9][ss] - s[22][ss])) * 0.839349645416;
-    var t21 = (s[10][ss] + s[21][ss]);
-    var t22 = @as(f32, @floatFromInt(s[10][ss] - s[21][ss])) * 0.972568237862;
-    var t23 = (s[11][ss] + s[20][ss]);
-    var t24 = @as(f32, @floatFromInt(s[11][ss] - s[20][ss])) * 1.16943993343;
-    var t25 = (s[12][ss] + s[19][ss]);
-    var t26 = @as(f32, @floatFromInt(s[12][ss] - s[19][ss])) * 1.48416461631;
-    var t27 = (s[13][ss] + s[18][ss]);
-    var t28 = @as(f32, @floatFromInt(s[13][ss] - s[18][ss])) * 2.05778100995;
-    var t29 = (s[14][ss] + s[17][ss]);
-    var t30 = @as(f32, @floatFromInt(s[14][ss] - s[17][ss])) * 3.40760841847;
-    var t31 = (s[15][ss] + s[16][ss]);
-    var t32 = @as(f32, @floatFromInt(s[15][ss] - s[16][ss])) * 10.1900081235;
-    var t33 = t01 + t31;
+    const si: usize = @intCast(ss);
 
-    t31 = @intFromFloat(@as(f32, @floatFromInt(t01 - t31)) * 0.502419286188);
+    var t01: f32 = intToF32(s[0][si] + s[31][si]);
+    var t02: f32 = intToF32(s[0][si] - s[31][si]) * f32c(0.500602998235);
+    var t03: f32 = intToF32(s[1][si] + s[30][si]);
+    var t04: f32 = intToF32(s[1][si] - s[30][si]) * f32c(0.505470959898);
+    var t05: f32 = intToF32(s[2][si] + s[29][si]);
+    var t06: f32 = intToF32(s[2][si] - s[29][si]) * f32c(0.515447309923);
+    var t07: f32 = intToF32(s[3][si] + s[28][si]);
+    var t08: f32 = intToF32(s[3][si] - s[28][si]) * f32c(0.53104259109);
+    var t09: f32 = intToF32(s[4][si] + s[27][si]);
+    var t10: f32 = intToF32(s[4][si] - s[27][si]) * f32c(0.553103896034);
+    var t11: f32 = intToF32(s[5][si] + s[26][si]);
+    var t12: f32 = intToF32(s[5][si] - s[26][si]) * f32c(0.582934968206);
+    var t13: f32 = intToF32(s[6][si] + s[25][si]);
+    var t14: f32 = intToF32(s[6][si] - s[25][si]) * f32c(0.622504123036);
+    var t15: f32 = intToF32(s[7][si] + s[24][si]);
+    var t16: f32 = intToF32(s[7][si] - s[24][si]) * f32c(0.674808341455);
+    var t17: f32 = intToF32(s[8][si] + s[23][si]);
+    var t18: f32 = intToF32(s[8][si] - s[23][si]) * f32c(0.744536271002);
+    var t19: f32 = intToF32(s[9][si] + s[22][si]);
+    var t20: f32 = intToF32(s[9][si] - s[22][si]) * f32c(0.839349645416);
+    var t21: f32 = intToF32(s[10][si] + s[21][si]);
+    var t22: f32 = intToF32(s[10][si] - s[21][si]) * f32c(0.972568237862);
+    var t23: f32 = intToF32(s[11][si] + s[20][si]);
+    var t24: f32 = intToF32(s[11][si] - s[20][si]) * f32c(1.16943993343);
+    var t25: f32 = intToF32(s[12][si] + s[19][si]);
+    var t26: f32 = intToF32(s[12][si] - s[19][si]) * f32c(1.48416461631);
+    var t27: f32 = intToF32(s[13][si] + s[18][si]);
+    var t28: f32 = intToF32(s[13][si] - s[18][si]) * f32c(2.05778100995);
+    var t29: f32 = intToF32(s[14][si] + s[17][si]);
+    var t30: f32 = intToF32(s[14][si] - s[17][si]) * f32c(3.40760841847);
+    var t31: f32 = intToF32(s[15][si] + s[16][si]);
+    var t32: f32 = intToF32(s[15][si] - s[16][si]) * f32c(10.1900081235);
+
+    var t33: f32 = t01 + t31;
+    t31 = (t01 - t31) * f32c(0.502419286188);
     t01 = t03 + t29;
-    t29 = @intFromFloat(@as(f32, @floatFromInt(t03 - t29)) * 0.52249861494);
+    t29 = (t03 - t29) * f32c(0.52249861494);
     t03 = t05 + t27;
-    t27 = @intFromFloat(@as(f32, @floatFromInt(t05 - t27)) * 0.566944034816);
+    t27 = (t05 - t27) * f32c(0.566944034816);
     t05 = t07 + t25;
-    t25 = @intFromFloat(@as(f32, @floatFromInt(t07 - t25)) * 0.64682178336);
+    t25 = (t07 - t25) * f32c(0.64682178336);
     t07 = t09 + t23;
-    t23 = @intFromFloat(@as(f32, @floatFromInt(t09 - t23)) * 0.788154623451);
+    t23 = (t09 - t23) * f32c(0.788154623451);
     t09 = t11 + t21;
-    t21 = @intFromFloat(@as(f32, @floatFromInt(t11 - t21)) * 1.06067768599);
+    t21 = (t11 - t21) * f32c(1.06067768599);
     t11 = t13 + t19;
-    t19 = @intFromFloat(@as(f32, @floatFromInt(t13 - t19)) * 1.72244709824);
+    t19 = (t13 - t19) * f32c(1.72244709824);
     t13 = t15 + t17;
-    t17 = @intFromFloat(@as(f32, @floatFromInt(t15 - t17)) * 5.10114861869);
+    t17 = (t15 - t17) * f32c(5.10114861869);
     t15 = t33 + t13;
-    t13 = @intFromFloat(@as(f32, @floatFromInt(t33 - t13)) * 0.509795579104);
+    t13 = (t33 - t13) * f32c(0.509795579104);
     t33 = t01 + t11;
-    t01 = @intFromFloat(@as(f32, @floatFromInt(t01 - t11)) * 0.601344886935);
+    t01 = (t01 - t11) * f32c(0.601344886935);
     t11 = t03 + t09;
-    t09 = @intFromFloat(@as(f32, @floatFromInt(t03 - t09)) * 0.899976223136);
+    t09 = (t03 - t09) * f32c(0.899976223136);
     t03 = t05 + t07;
-    t07 = @intFromFloat(@as(f32, @floatFromInt(t05 - t07)) * 2.56291544774);
+    t07 = (t05 - t07) * f32c(2.56291544774);
     t05 = t15 + t03;
-    t15 = @intFromFloat(@as(f32, @floatFromInt(t15 - t03)) * 0.541196100146);
+    t15 = (t15 - t03) * f32c(0.541196100146);
     t03 = t33 + t11;
-    t11 = @intFromFloat(@as(f32, @floatFromInt(t33 - t11)) * 1.30656296488);
+    t11 = (t33 - t11) * f32c(1.30656296488);
     t33 = t05 + t03;
-    t05 = @intFromFloat(@as(f32, @floatFromInt(t05 - t03)) * 0.707106781187);
+    t05 = (t05 - t03) * f32c(0.707106781187);
     t03 = t15 + t11;
-    t15 = @intFromFloat(@as(f32, @floatFromInt(t15 - t11)) * 0.707106781187);
+    t15 = (t15 - t11) * f32c(0.707106781187);
     t03 += t15;
     t11 = t13 + t07;
-    t13 = @intFromFloat(@as(f32, @floatFromInt(t13 - t07)) * 0.541196100146);
+    t13 = (t13 - t07) * f32c(0.541196100146);
     t07 = t01 + t09;
-    t09 = @intFromFloat(@as(f32, @floatFromInt(t01 - t09)) * 1.30656296488);
+    t09 = (t01 - t09) * f32c(1.30656296488);
     t01 = t11 + t07;
-    t07 = @intFromFloat(@as(f32, @floatFromInt(t11 - t07)) * 0.707106781187);
+    t07 = (t11 - t07) * f32c(0.707106781187);
     t11 = t13 + t09;
-    t13 = @intFromFloat(@as(f32, @floatFromInt(t13 - t09)) * 0.707106781187);
+    t13 = (t13 - t09) * f32c(0.707106781187);
     t11 += t13;
     t01 += t11;
     t11 += t07;
     t07 += t13;
+
     t09 = t31 + t17;
-    t31 = @intFromFloat(@as(f32, @floatFromInt(t31 - t17)) * 0.509795579104);
+    t31 = (t31 - t17) * f32c(0.509795579104);
     t17 = t29 + t19;
-    t29 = @intFromFloat(@as(f32, @floatFromInt(t29 - t19)) * 0.601344886935);
+    t29 = (t29 - t19) * f32c(0.601344886935);
     t19 = t27 + t21;
-    t21 = @intFromFloat(@as(f32, @floatFromInt(t27 - t21)) * 0.899976223136);
+    t21 = (t27 - t21) * f32c(0.899976223136);
     t27 = t25 + t23;
-    t23 = @intFromFloat(@as(f32, @floatFromInt(t25 - t23)) * 2.56291544774);
+    t23 = (t25 - t23) * f32c(2.56291544774);
     t25 = t09 + t27;
-    t09 = @intFromFloat(@as(f32, @floatFromInt(t09 - t27)) * 0.541196100146);
+    t09 = (t09 - t27) * f32c(0.541196100146);
     t27 = t17 + t19;
-    t19 = @intFromFloat(@as(f32, @floatFromInt(t17 - t19)) * 1.30656296488);
+    t19 = (t17 - t19) * f32c(1.30656296488);
     t17 = t25 + t27;
-    t27 = @intFromFloat(@as(f32, @floatFromInt(t25 - t27)) * 0.707106781187);
+    t27 = (t25 - t27) * f32c(0.707106781187);
     t25 = t09 + t19;
-    t19 = @intFromFloat(@as(f32, @floatFromInt(t09 - t19)) * 0.707106781187);
+    t19 = (t09 - t19) * f32c(0.707106781187);
     t25 += t19;
     t09 = t31 + t23;
-    t31 = @intFromFloat(@as(f32, @floatFromInt(t31 - t23)) * 0.541196100146);
+    t31 = (t31 - t23) * f32c(0.541196100146);
     t23 = t29 + t21;
-    t21 = @intFromFloat(@as(f32, @floatFromInt(t29 - t21)) * 1.30656296488);
+    t21 = (t29 - t21) * f32c(1.30656296488);
     t29 = t09 + t23;
-    t23 = @intFromFloat(@as(f32, @floatFromInt(t09 - t23)) * 0.707106781187);
+    t23 = (t09 - t23) * f32c(0.707106781187);
     t09 = t31 + t21;
-    t31 = @intFromFloat(@as(f32, @floatFromInt(t31 - t21)) * 0.707106781187);
+    t31 = (t31 - t21) * f32c(0.707106781187);
     t09 += t31;
     t29 += t09;
     t09 += t23;
     t23 += t31;
+
     t17 += t29;
     t29 += t25;
     t25 += t09;
@@ -599,80 +622,86 @@ fn idct36(s: [32][3]i32, ss: u32, d: []f32, dp: i32) void {
     t27 += t23;
     t23 += t19;
     t19 += t31;
-    t21 = @intFromFloat(t02 + t32);
-    t02 = (t02 - t32) * 0.502419286188;
+
+    t21 = t02 + t32;
+    t02 = (t02 - t32) * f32c(0.502419286188);
     t32 = t04 + t30;
-    t04 = (t04 - t30) * 0.52249861494;
+    t04 = (t04 - t30) * f32c(0.52249861494);
     t30 = t06 + t28;
-    t28 = (t06 - t28) * 0.566944034816;
+    t28 = (t06 - t28) * f32c(0.566944034816);
     t06 = t08 + t26;
-    t08 = (t08 - t26) * 0.64682178336;
+    t08 = (t08 - t26) * f32c(0.64682178336);
     t26 = t10 + t24;
-    t10 = (t10 - t24) * 0.788154623451;
+    t10 = (t10 - t24) * f32c(0.788154623451);
     t24 = t12 + t22;
-    t22 = (t12 - t22) * 1.06067768599;
+    t22 = (t12 - t22) * f32c(1.06067768599);
     t12 = t14 + t20;
-    t20 = (t14 - t20) * 1.72244709824;
+    t20 = (t14 - t20) * f32c(1.72244709824);
     t14 = t16 + t18;
-    t16 = (t16 - t18) * 5.10114861869;
-    t18 = @as(f32, @floatFromInt(t21)) + t14;
-    t14 = (@as(f32, @floatFromInt(t21)) - t14) * 0.509795579104;
-    t21 = @intFromFloat(t32 + t12);
-    t32 = (t32 - t12) * 0.601344886935;
+    t16 = (t16 - t18) * f32c(5.10114861869);
+
+    t18 = t21 + t14;
+    t14 = (t21 - t14) * f32c(0.509795579104);
+    t21 = t32 + t12;
+    t32 = (t32 - t12) * f32c(0.601344886935);
     t12 = t30 + t24;
-    t24 = (t30 - t24) * 0.899976223136;
+    t24 = (t30 - t24) * f32c(0.899976223136);
     t30 = t06 + t26;
-    t26 = (t06 - t26) * 2.56291544774;
+    t26 = (t06 - t26) * f32c(2.56291544774);
     t06 = t18 + t30;
-    t18 = (t18 - t30) * 0.541196100146;
-    t30 = @as(f32, @floatFromInt(t21)) + t12;
-    t12 = (@as(f32, @floatFromInt(t21)) - t12) * 1.30656296488;
-    t21 = @intFromFloat(t06 + t30);
-    t30 = (t06 - t30) * 0.707106781187;
+    t18 = (t18 - t30) * f32c(0.541196100146);
+    t30 = t21 + t12;
+    t12 = (t21 - t12) * f32c(1.30656296488);
+    t21 = t06 + t30;
+    t30 = (t06 - t30) * f32c(0.707106781187);
     t06 = t18 + t12;
-    t12 = (t18 - t12) * 0.707106781187;
+    t12 = (t18 - t12) * f32c(0.707106781187);
     t06 += t12;
+
     t18 = t14 + t26;
-    t26 = (t14 - t26) * 0.541196100146;
+    t26 = (t14 - t26) * f32c(0.541196100146);
     t14 = t32 + t24;
-    t24 = (t32 - t24) * 1.30656296488;
+    t24 = (t32 - t24) * f32c(1.30656296488);
     t32 = t18 + t14;
-    t14 = (t18 - t14) * 0.707106781187;
+    t14 = (t18 - t14) * f32c(0.707106781187);
     t18 = t26 + t24;
-    t24 = (t26 - t24) * 0.707106781187;
+    t24 = (t26 - t24) * f32c(0.707106781187);
     t18 += t24;
     t32 += t18;
     t18 += t14;
     t26 = t14 + t24;
+
     t14 = t02 + t16;
-    t02 = (t02 - t16) * 0.509795579104;
+    t02 = (t02 - t16) * f32c(0.509795579104);
     t16 = t04 + t20;
-    t04 = (t04 - t20) * 0.601344886935;
+    t04 = (t04 - t20) * f32c(0.601344886935);
     t20 = t28 + t22;
-    t22 = (t28 - t22) * 0.899976223136;
+    t22 = (t28 - t22) * f32c(0.899976223136);
     t28 = t08 + t10;
-    t10 = (t08 - t10) * 2.56291544774;
+    t10 = (t08 - t10) * f32c(2.56291544774);
     t08 = t14 + t28;
-    t14 = (t14 - t28) * 0.541196100146;
+    t14 = (t14 - t28) * f32c(0.541196100146);
     t28 = t16 + t20;
-    t20 = (t16 - t20) * 1.30656296488;
+    t20 = (t16 - t20) * f32c(1.30656296488);
     t16 = t08 + t28;
-    t28 = (t08 - t28) * 0.707106781187;
+    t28 = (t08 - t28) * f32c(0.707106781187);
     t08 = t14 + t20;
-    t20 = (t14 - t20) * 0.707106781187;
+    t20 = (t14 - t20) * f32c(0.707106781187);
     t08 += t20;
+
     t14 = t02 + t10;
-    t02 = (t02 - t10) * 0.541196100146;
+    t02 = (t02 - t10) * f32c(0.541196100146);
     t10 = t04 + t22;
-    t22 = (t04 - t22) * 1.30656296488;
+    t22 = (t04 - t22) * f32c(1.30656296488);
     t04 = t14 + t10;
-    t10 = (t14 - t10) * 0.707106781187;
+    t10 = (t14 - t10) * f32c(0.707106781187);
     t14 = t02 + t22;
-    t02 = (t02 - t22) * 0.707106781187;
+    t02 = (t02 - t22) * f32c(0.707106781187);
     t14 += t02;
     t04 += t14;
     t14 += t10;
     t10 += t02;
+
     t16 += t04;
     t04 += t08;
     t08 += t14;
@@ -680,7 +709,8 @@ fn idct36(s: [32][3]i32, ss: u32, d: []f32, dp: i32) void {
     t28 += t10;
     t10 += t20;
     t20 += t02;
-    t21 += @intFromFloat(t16);
+
+    t21 += t16;
     t16 += t32;
     t32 += t04;
     t04 += t06;
@@ -696,68 +726,71 @@ fn idct36(s: [32][3]i32, ss: u32, d: []f32, dp: i32) void {
     t20 += t24;
     t24 += t02;
 
-    d[@intCast(dp + 48)] = @floatFromInt(-t33);
-    d[@intCast(dp + 49)] = @floatFromInt(-t21);
-    d[@intCast(dp + 47)] = @floatFromInt(-t21);
-    d[@intCast(dp + 50)] = @floatFromInt(-t17);
-    d[@intCast(dp + 46)] = @floatFromInt(-t17);
-    d[@intCast(dp + 51)] = -t16;
-    d[@intCast(dp + 45)] = -t16;
-    d[@intCast(dp + 52)] = @floatFromInt(-t01);
-    d[@intCast(dp + 44)] = @floatFromInt(-t01);
-    d[@intCast(dp + 53)] = -t32;
-    d[@intCast(dp + 43)] = -t32;
-    d[@intCast(dp + 54)] = @floatFromInt(-t29);
-    d[@intCast(dp + 42)] = @floatFromInt(-t29);
-    d[@intCast(dp + 55)] = -t04;
-    d[@intCast(dp + 41)] = -t04;
-    d[@intCast(dp + 56)] = @floatFromInt(-t03);
-    d[@intCast(dp + 40)] = @floatFromInt(-t03);
-    d[@intCast(dp + 57)] = -t06;
-    d[@intCast(dp + 39)] = -t06;
-    d[@intCast(dp + 58)] = @floatFromInt(-t25);
-    d[@intCast(dp + 38)] = @floatFromInt(-t25);
-    d[@intCast(dp + 59)] = -t08;
-    d[@intCast(dp + 37)] = -t08;
-    d[@intCast(dp + 60)] = @floatFromInt(-t11);
-    d[@intCast(dp + 36)] = @floatFromInt(-t11);
-    d[@intCast(dp + 61)] = -t18;
-    d[@intCast(dp + 35)] = -t18;
-    d[@intCast(dp + 62)] = @floatFromInt(-t09);
-    d[@intCast(dp + 34)] = @floatFromInt(-t09);
-    d[@intCast(dp + 63)] = -t14;
-    d[@intCast(dp + 33)] = -t14;
-    d[@intCast(dp + 32)] = @floatFromInt(-t05);
-    d[@intCast(dp + 0)] = @floatFromInt(t05);
-    d[@intCast(dp + 31)] = -t30;
-    d[@intCast(dp + 1)] = t30;
-    d[@intCast(dp + 30)] = @floatFromInt(t27);
-    d[@intCast(dp + 2)] = @floatFromInt(t27);
-    d[@intCast(dp + 29)] = -t28;
-    d[@intCast(dp + 3)] = t28;
-    d[@intCast(dp + 28)] = @floatFromInt(-t07);
-    d[@intCast(dp + 4)] = @floatFromInt(t07);
-    d[@intCast(dp + 27)] = -t26;
-    d[@intCast(dp + 5)] = t26;
-    d[@intCast(dp + 26)] = @floatFromInt(-t23);
-    d[@intCast(dp + 6)] = @floatFromInt(t23);
-    d[@intCast(dp + 25)] = -t10;
-    d[@intCast(dp + 7)] = t10;
-    d[@intCast(dp + 24)] = @floatFromInt(-t15);
-    d[@intCast(dp + 8)] = @floatFromInt(t15);
-    d[@intCast(dp + 23)] = -t12;
-    d[@intCast(dp + 9)] = t12;
-    d[@intCast(dp + 22)] = @floatFromInt(-t19);
-    d[@intCast(dp + 10)] = @floatFromInt(t19);
-    d[@intCast(dp + 21)] = -t20;
-    d[@intCast(dp + 11)] = t20;
-    d[@intCast(dp + 20)] = @floatFromInt(-t13);
-    d[@intCast(dp + 12)] = @floatFromInt(t13);
-    d[@intCast(dp + 19)] = -t24;
-    d[@intCast(dp + 13)] = t24;
-    d[@intCast(dp + 18)] = @floatFromInt(-t31);
-    d[@intCast(dp + 14)] = @floatFromInt(t31);
-    d[@intCast(dp + 17)] = -t02;
-    d[@intCast(dp + 15)] = t02;
-    d[@intCast(dp + 16)] = 0.0;
+    const base: usize = @intCast(dp);
+    d[base + 48] = -t33;
+    d[base + 49] = -t21;
+    d[base + 47] = -t21;
+    d[base + 50] = -t17;
+    d[base + 46] = -t17;
+    d[base + 51] = -t16;
+    d[base + 45] = -t16;
+    d[base + 52] = -t01;
+    d[base + 44] = -t01;
+    d[base + 53] = -t32;
+    d[base + 43] = -t32;
+    d[base + 54] = -t29;
+    d[base + 42] = -t29;
+    d[base + 55] = -t04;
+    d[base + 41] = -t04;
+    d[base + 56] = -t03;
+    d[base + 40] = -t03;
+    d[base + 57] = -t06;
+    d[base + 39] = -t06;
+    d[base + 58] = -t25;
+    d[base + 38] = -t25;
+    d[base + 59] = -t08;
+    d[base + 37] = -t08;
+    d[base + 60] = -t11;
+    d[base + 36] = -t11;
+    d[base + 61] = -t18;
+    d[base + 35] = -t18;
+    d[base + 62] = -t09;
+    d[base + 34] = -t09;
+    d[base + 63] = -t14;
+
+    d[base + 32] = -t05;
+    d[base + 0] = t05;
+    d[base + 31] = -t30;
+    d[base + 1] = t30;
+    d[base + 30] = -t27;
+    d[base + 2] = t27;
+    d[base + 29] = -t28;
+    d[base + 3] = t28;
+    d[base + 28] = -t07;
+    d[base + 4] = t07;
+    d[base + 27] = -t26;
+    d[base + 5] = t26;
+    d[base + 26] = -t23;
+    d[base + 6] = t23;
+    d[base + 25] = -t10;
+    d[base + 7] = t10;
+    d[base + 24] = -t15;
+    d[base + 8] = t15;
+    d[base + 23] = -t12;
+    d[base + 9] = t12;
+    d[base + 22] = -t19;
+    d[base + 10] = t19;
+    d[base + 21] = -t20;
+    d[base + 11] = t20;
+    d[base + 20] = -t13;
+    d[base + 12] = t13;
+    d[base + 19] = -t24;
+    d[base + 13] = t24;
+    d[base + 18] = -t31;
+    d[base + 14] = t31;
+    d[base + 17] = -t02;
+    d[base + 15] = t02;
+    d[base + 16] = 0.0;
 }
+
+
