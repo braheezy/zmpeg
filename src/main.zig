@@ -9,6 +9,8 @@ var debug_allocator: std.heap.DebugAllocator(.{}) = .init;
 const fnv_offset_basis: u64 = 1469598103934665603;
 const fnv_prime: u64 = 1099511628211;
 
+var texture_info_logged: bool = false;
+
 fn hashFrame(hash: u64, data: []const u8) u64 {
     var h = hash;
     for (data) |byte| {
@@ -59,51 +61,125 @@ fn frameToBgr(frame: *const zmpeg.Frame, dest: []u8, row_stride: usize) void {
 
             if (y_index < y_data.len) {
                 const yy0 = ((@as(i32, y_data[y_index]) - 16) * 76_309) >> 16;
-                if (d_index + 3 < dest.len) {
-                    dest[d_index + 0] = clampToU8(yy0 + r);
+                if (d_index + 2 < dest.len) {
+                    dest[d_index + 2] = clampToU8(yy0 + r);
                     dest[d_index + 1] = clampToU8(yy0 - g);
-                    dest[d_index + 2] = clampToU8(yy0 + b);
-                    dest[d_index + 3] = 255;
+                    dest[d_index + 0] = clampToU8(yy0 + b);
                 }
             }
 
             if (y_index + 1 < y_data.len) {
                 const yy1 = ((@as(i32, y_data[y_index + 1]) - 16) * 76_309) >> 16;
-                const dst1 = d_index + 4;
-                if (dst1 + 3 < dest.len) {
-                    dest[dst1 + 0] = clampToU8(yy1 + r);
+                const dst1 = d_index + 3;
+                if (dst1 + 2 < dest.len) {
+                    dest[dst1 + 2] = clampToU8(yy1 + r);
                     dest[dst1 + 1] = clampToU8(yy1 - g);
-                    dest[dst1 + 2] = clampToU8(yy1 + b);
-                    dest[dst1 + 3] = 255;
+                    dest[dst1 + 0] = clampToU8(yy1 + b);
                 }
             }
 
             if (y_index + y_stride_usize < y_data.len) {
                 const yy2 = ((@as(i32, y_data[y_index + y_stride_usize]) - 16) * 76_309) >> 16;
                 const dst2 = d_index + row_stride;
-                if (dst2 + 3 < dest.len) {
-                    dest[dst2 + 0] = clampToU8(yy2 + r);
+                if (dst2 + 2 < dest.len) {
+                    dest[dst2 + 2] = clampToU8(yy2 + r);
                     dest[dst2 + 1] = clampToU8(yy2 - g);
-                    dest[dst2 + 2] = clampToU8(yy2 + b);
-                    dest[dst2 + 3] = 255;
+                    dest[dst2 + 0] = clampToU8(yy2 + b);
                 }
             }
 
             if (y_index + y_stride_usize + 1 < y_data.len) {
                 const yy3 = ((@as(i32, y_data[y_index + y_stride_usize + 1]) - 16) * 76_309) >> 16;
-                const dst3 = d_index + row_stride + 4;
-                if (dst3 + 3 < dest.len) {
-                    dest[dst3 + 0] = clampToU8(yy3 + r);
+                const dst3 = d_index + row_stride + 3;
+                if (dst3 + 2 < dest.len) {
+                    dest[dst3 + 2] = clampToU8(yy3 + r);
                     dest[dst3 + 1] = clampToU8(yy3 - g);
-                    dest[dst3 + 2] = clampToU8(yy3 + b);
-                    dest[dst3 + 3] = 255;
+                    dest[dst3 + 0] = clampToU8(yy3 + b);
                 }
             }
 
             c_index += 1;
             y_index += 2;
-            d_index += 8;
+            d_index += 6;
         }
+    }
+}
+
+fn runTestPattern(allocator: std.mem.Allocator) !void {
+    const width: i32 = 640;
+    const height: i32 = 360;
+    const width_usize: usize = @as(usize, @intCast(width));
+    const height_usize: usize = @as(usize, @intCast(height));
+    const pitch: usize = width_usize * 4;
+    const frame_size: usize = pitch * height_usize;
+
+    try sdl.init(.{ .video = true, .audio = false });
+    defer sdl.quit();
+
+    var buffer = try allocator.alloc(u8, frame_size);
+    defer allocator.free(buffer);
+
+    { // Fill RGBA gradient test pattern.
+        var y: usize = 0;
+        const denom_x = if (width_usize > 1) width_usize - 1 else 1;
+        const denom_y = if (height_usize > 1) height_usize - 1 else 1;
+
+        while (y < height_usize) : (y += 1) {
+            var x: usize = 0;
+            while (x < width_usize) : (x += 1) {
+                const idx = y * pitch + x * 4;
+                const r_val = @min(255, (x * 255) / denom_x);
+                const g_val = @min(255, (y * 255) / denom_y);
+                const r: u8 = @intCast(r_val);
+                const g: u8 = @intCast(g_val);
+                const checker = ((x / 40) ^ (y / 40)) & 1;
+                const b: u8 = if (checker == 0) 64 else 192;
+                buffer[idx + 0] = r;
+                buffer[idx + 1] = g;
+                buffer[idx + 2] = b;
+                buffer[idx + 3] = 255;
+            }
+        }
+    }
+
+    const window = try sdl.createWindow(
+        "ZMPEG Test Pattern",
+        .centered,
+        .centered,
+        width,
+        height,
+        .{},
+    );
+    defer window.destroy();
+
+    const renderer = try sdl.createRenderer(window, null, .{
+        .accelerated = true,
+        .present_vsync = true,
+    });
+    defer renderer.destroy();
+
+    const texture = try sdl.createTexture(renderer, .rgba8888, .streaming, width, height);
+    defer texture.destroy();
+
+    try texture.update(buffer, pitch, null);
+    try renderer.setColorRGB(0, 0, 0);
+    try renderer.clear();
+    const dest = calculateAspectRatioRect(width, height, width, height);
+    try renderer.copy(texture, null, dest);
+    renderer.present();
+
+    var running = true;
+    while (running) {
+        while (sdl.pollEvent()) |ev| {
+            switch (ev) {
+                .quit => running = false,
+                .key_down => |key| {
+                    if (key.scancode == .escape) running = false;
+                },
+                else => {},
+            }
+        }
+        sdl.delay(16);
     }
 }
 
@@ -198,7 +274,6 @@ fn initAudioOutput(allocator: std.mem.Allocator, sample_rate: u32) !AudioOutput 
         return err;
     };
 
-
     var output = AudioOutput{
         .allocator = allocator,
         .device = result.device,
@@ -253,6 +328,7 @@ pub fn main() !void {
 
     var input_path: []const u8 = "trouble-pogo-5s.mpg";
     var test_audio_packets: ?usize = null;
+    var run_test_pattern = false;
     var audio_dump_path: ?[]const u8 = null;
 
     var i: usize = 1;
@@ -268,7 +344,14 @@ pub fn main() !void {
             };
         } else if (std.mem.startsWith(u8, arg, "--dump-audio=")) {
             audio_dump_path = arg["--dump-audio=".len..];
+        } else if (std.mem.eql(u8, arg, "--test-pattern")) {
+            run_test_pattern = true;
         }
+    }
+
+    if (run_test_pattern) {
+        try runTestPattern(allocator);
+        return;
     }
 
     // Initialize MPEG decoder
@@ -295,6 +378,9 @@ pub fn main() !void {
     var window: sdl.Window = undefined;
     var renderer: sdl.Renderer = undefined;
     var texture: sdl.Texture = undefined;
+    var window_ready = false;
+    var renderer_ready = false;
+    var texture_ready = false;
     var dest_rect: sdl.Rectangle = undefined;
 
     if (need_sdl) {
@@ -318,7 +404,7 @@ pub fn main() !void {
                 break :video_init;
             };
             window = created_window;
-            defer if (need_video) window.destroy();
+            window_ready = true;
 
             const created_renderer = sdl.createRenderer(window, null, .{
                 .accelerated = true,
@@ -326,37 +412,56 @@ pub fn main() !void {
             }) catch |err| {
                 std.debug.print("Warning: SDL renderer init failed ({}) – continuing without video.\n", .{err});
                 window.destroy();
+                window_ready = false;
                 need_video = false;
                 break :video_init;
             };
             renderer = created_renderer;
-            defer if (need_video) renderer.destroy();
+            renderer_ready = true;
 
             const created_texture = sdl.createTexture(
                 renderer,
-                .rgba8888,
+                .rgb24,
                 .streaming,
                 @intCast(width),
                 @intCast(height),
             ) catch |err| {
                 std.debug.print("Warning: SDL texture init failed ({}) – continuing without video.\n", .{err});
                 renderer.destroy();
+                renderer_ready = false;
                 window.destroy();
+                window_ready = false;
                 need_video = false;
                 break :video_init;
             };
             texture = created_texture;
-            defer if (need_video) texture.destroy();
+            texture_ready = true;
+
+            if (!texture_info_logged) {
+                const tex_info_result = sdl.Texture.query(texture);
+                if (tex_info_result) |info| {
+                    texture_info_logged = true;
+                    std.debug.print(
+                        "SDL texture created: format={any} access={d} size={d}x{d}\n",
+                        .{ info.format, @intFromEnum(info.access), info.width, info.height },
+                    );
+                } else |err| {
+                    std.debug.print("Failed to query texture info: {}\n", .{err});
+                }
+            }
 
             dest_rect = calculateAspectRatioRect(window_width, window_height, @intCast(width), @intCast(height));
 
-            row_stride = @as(usize, @intCast(width)) * 4;
+            row_stride = @as(usize, @intCast(width)) * 3;
             const frame_size = @as(usize, @intCast(height)) * row_stride;
             frame_buffer = allocator.alloc(u8, frame_size) catch |err| {
-                std.debug.print("Warning: failed to allocate video buffer ({}). Disabling video.\n", .{err});
+                std.debug.print("Warning: failed to allocate video buffer ({}); disabling video.\n", .{err});
                 texture.destroy();
+                texture_ready = false;
                 renderer.destroy();
+                renderer_ready = false;
                 window.destroy();
+                window_ready = false;
                 need_video = false;
                 break :video_init;
             };
@@ -364,6 +469,9 @@ pub fn main() !void {
         }
     }
 
+    defer if (texture_ready) texture.destroy();
+    defer if (renderer_ready) renderer.destroy();
+    defer if (window_ready) window.destroy();
     defer if (frame_buffer_allocated) allocator.free(frame_buffer);
 
     // Optional audio dump file
@@ -410,15 +518,29 @@ pub fn main() !void {
             if (need_video) {
                 if (maybe_frame) |frame| {
                     if (test_audio_packets == null) {
-                        // Convert frame to BGR
                         const frame_view: *const zmpeg.Frame = @ptrCast(frame);
                         frameToBgr(frame_view, frame_buffer, row_stride);
 
+                        std.debug.print(
+                            "Uploading RGB frame: stride={d} buffer_len={d}\n",
+                            .{ row_stride, frame_buffer.len },
+                        );
+
                         texture.update(frame_buffer, row_stride, null) catch |err| {
-                            std.debug.print("Warning: texture update failed ({}); disabling video.\n", .{err});
-                            texture.destroy();
-                            renderer.destroy();
-                            window.destroy();
+                            const sdl_err = sdl.getError() orelse "unknown";
+                            std.debug.print("Warning: texture update failed ({}): {s}; disabling video.\n", .{ err, sdl_err });
+                            if (texture_ready) {
+                                texture.destroy();
+                                texture_ready = false;
+                            }
+                            if (renderer_ready) {
+                                renderer.destroy();
+                                renderer_ready = false;
+                            }
+                            if (window_ready) {
+                                window.destroy();
+                                window_ready = false;
+                            }
                             if (frame_buffer_allocated) {
                                 allocator.free(frame_buffer);
                                 frame_buffer_allocated = false;
@@ -429,10 +551,23 @@ pub fn main() !void {
                         };
 
                         renderer.setColorRGB(0, 0, 0) catch |err| {
-                            std.debug.print("Warning: renderer setColor failed ({}); disabling video.\n", .{err});
-                            renderer.destroy();
-                            window.destroy();
-                            texture.destroy();
+                            const sdl_err = sdl.getError() orelse "unknown";
+                            std.debug.print(
+                                "Warning: renderer setColor failed ({}): {s}; disabling video.\n",
+                                .{ err, sdl_err },
+                            );
+                            if (renderer_ready) {
+                                renderer.destroy();
+                                renderer_ready = false;
+                            }
+                            if (window_ready) {
+                                window.destroy();
+                                window_ready = false;
+                            }
+                            if (texture_ready) {
+                                texture.destroy();
+                                texture_ready = false;
+                            }
                             if (frame_buffer_allocated) {
                                 allocator.free(frame_buffer);
                                 frame_buffer_allocated = false;
@@ -443,10 +578,23 @@ pub fn main() !void {
                         };
 
                         renderer.clear() catch |err| {
-                            std.debug.print("Warning: renderer clear failed ({}); disabling video.\n", .{err});
-                            renderer.destroy();
-                            window.destroy();
-                            texture.destroy();
+                            const sdl_err = sdl.getError() orelse "unknown";
+                            std.debug.print(
+                                "Warning: renderer clear failed ({}): {s}; disabling video.\n",
+                                .{ err, sdl_err },
+                            );
+                            if (renderer_ready) {
+                                renderer.destroy();
+                                renderer_ready = false;
+                            }
+                            if (window_ready) {
+                                window.destroy();
+                                window_ready = false;
+                            }
+                            if (texture_ready) {
+                                texture.destroy();
+                                texture_ready = false;
+                            }
                             if (frame_buffer_allocated) {
                                 allocator.free(frame_buffer);
                                 frame_buffer_allocated = false;
@@ -457,10 +605,23 @@ pub fn main() !void {
                         };
 
                         renderer.copy(texture, null, dest_rect) catch |err| {
-                            std.debug.print("Warning: renderer copy failed ({}); disabling video.\n", .{err});
-                            renderer.destroy();
-                            window.destroy();
-                            texture.destroy();
+                            const sdl_err = sdl.getError() orelse "unknown";
+                            std.debug.print(
+                                "Warning: renderer copy failed ({}): {s}; disabling video.\n",
+                                .{ err, sdl_err },
+                            );
+                            if (renderer_ready) {
+                                renderer.destroy();
+                                renderer_ready = false;
+                            }
+                            if (window_ready) {
+                                window.destroy();
+                                window_ready = false;
+                            }
+                            if (texture_ready) {
+                                texture.destroy();
+                                texture_ready = false;
+                            }
                             if (frame_buffer_allocated) {
                                 allocator.free(frame_buffer);
                                 frame_buffer_allocated = false;
@@ -558,7 +719,7 @@ pub fn main() !void {
                                         }
                                     }
                                 } else break;
-                           }
+                            }
 
                             reader.discardReadBytes();
                         }
