@@ -8,7 +8,7 @@ const mpeg_mod = @import("mpeg.zig");
 pub const BitReader = bitreader_mod.BitReader;
 pub const Demux = demux_mod.Demux;
 
-pub const Video = mpeg_mod.Mpeg;
+pub const Mpeg = mpeg_mod.Mpeg;
 
 pub fn createFromFile(allocator: std.mem.Allocator, path: []const u8) !*Mpeg {
     const reader_ptr = try allocator.create(BitReader);
@@ -22,16 +22,14 @@ pub fn createFromFile(allocator: std.mem.Allocator, path: []const u8) !*Mpeg {
     return mpeg;
 }
 
-pub fn createFromMemory(allocator: std.mem.Allocator, data: []const u8) !Video {
+pub fn createFromMemory(allocator: std.mem.Allocator, data: []const u8) !*Mpeg {
     var reader = BitReader.initFromMemory(allocator, data);
-    return Video.init(allocator, &reader) catch |err| {
-        reader.deinit();
-        return err;
-    };
+    errdefer reader.deinit();
+    return try Mpeg.init(allocator, &reader);
 }
 
-pub fn createWithReader(allocator: std.mem.Allocator, reader: *BitReader) !Video {
-    return Video.init(allocator, reader);
+pub fn createWithReader(allocator: std.mem.Allocator, reader: *BitReader) !*Mpeg {
+    return Mpeg.init(allocator, reader);
 }
 
 pub const PLM_PACKET_INVALID_TS = types.PLM_PACKET_INVALID_TS;
@@ -45,7 +43,6 @@ pub const PictureType = types.PictureType;
 pub const StartCode = types.StartCode;
 pub const Vlc = types.Vlc;
 pub const VlcUint = types.VlcUint;
-pub const Mpeg = mpeg_mod.Mpeg;
 
 test "all" {
     @import("std").testing.refAllDecls(@This());

@@ -2,3 +2,7 @@ pl_mpeg
 *.md
 *.mp4
 !README.md
+.zig-global-cache
+my-SDL.zig
+*.raw
+*.log

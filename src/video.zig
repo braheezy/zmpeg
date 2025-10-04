@@ -1102,21 +1102,16 @@ fn blockSet(
     const max_source_index = source_index + rows_minus_one * source_width + block_size;
     if (max_dest_index > dest.len or max_source_index > source.len) return;
 
-    var di = dest_index;
-    var si = source_index;
-    const dest_scan = dest_width - block_size;
-    const source_scan = source_width - block_size;
-
     var y: usize = 0;
     while (y < block_size) : (y += 1) {
+        const dest_row = dest_index + y * dest_width;
+        const source_row = source_index + y * source_width;
         var x: usize = 0;
         while (x < block_size) : (x += 1) {
+            const di = dest_row + x;
+            const si = source_row + x;
             dest[di] = handler.apply(DestT, SourceT, dest, di, source, si);
-            di += 1;
-            si += 1;
         }
-        di += dest_scan;
-        si += source_scan;
     }
 }
 
@@ -1193,7 +1188,7 @@ const IntraHandler = struct {
         source: []const SourceT,
         si: usize,
     ) DestT {
-        return clampSignedToU8(source[si]);
+        return clampSignedToU8(@as(i32, source[si]));
     }
 };
 
@@ -1207,7 +1202,7 @@ const AddHandler = struct {
         source: []const SourceT,
         si: usize,
     ) DestT {
-        return clampSignedToU8(@as(i32, dest[di]) + source[si]);
+        return clampSignedToU8(@as(i32, dest[di]) + @as(i32, source[si]));
     }
 };
 
@@ -1222,8 +1217,10 @@ const AvgVerticalHandler = struct {
         source: []const SourceT,
         si: usize,
     ) DestT {
+        const next = si + self.stride;
+        if (next >= source.len) return @intCast(source[si]);
         const a: DestT = @intCast(source[si]);
-        const b: DestT = @intCast(source[si + self.stride]);
+        const b: DestT = @intCast(source[next]);
         return @intCast((@as(u16, a) + @as(u16, b) + 1) >> 1);
     }
 };
@@ -1238,8 +1235,10 @@ const AvgHorizontalHandler = struct {
         source: []const SourceT,
         si: usize,
     ) DestT {
+        const next = si + 1;
+        if (next >= source.len) return @intCast(source[si]);
         const a: DestT = @intCast(source[si]);
-        const b: DestT = @intCast(source[si + 1]);
+        const b: DestT = @intCast(source[next]);
         return @intCast((@as(u16, a) + @as(u16, b) + 1) >> 1);
     }
 };
@@ -1255,10 +1254,14 @@ const AvgBilinearHandler = struct {
         source: []const SourceT,
         si: usize,
     ) DestT {
+        const b_idx = si + 1;
+        const c_idx = si + self.stride;
+        const d_idx = si + self.stride + 1;
+        if (d_idx >= source.len) return @intCast(source[si]);
         const a: DestT = @intCast(source[si]);
-        const b: DestT = @intCast(source[si + 1]);
-        const c: DestT = @intCast(source[si + self.stride]);
-        const d: DestT = @intCast(source[si + self.stride + 1]);
+        const b: DestT = @intCast(source[b_idx]);
+        const c: DestT = @intCast(source[c_idx]);
+        const d: DestT = @intCast(source[d_idx]);
         return @intCast((@as(u16, a) + @as(u16, b) + @as(u16, c) + @as(u16, d) + 2) >> 2);
     }
 };

@@ -244,8 +244,8 @@ pub const Audio = struct {
                             sf[1] = val;
                             sf[2] = val;
                         },
-                       3 => {
-                           sf[0] = @intCast(try self.reader.readBits(6));
+                        3 => {
+                            sf[0] = @intCast(try self.reader.readBits(6));
                             const val: i32 = @intCast(try self.reader.readBits(6));
                             sf[1] = val;
                             sf[2] = val;
@@ -382,32 +382,14 @@ pub const Audio = struct {
         var val: i32 = 0;
 
         if (self.allocation[ch][sb]) |*q| {
-            if (self.samples_decoded == 0 and ch == 0 and sb == 0) {
-                const has_data = self.reader.has(@intCast(q.bits * 3)) catch false;
-                std.debug.print("BitReader has {d} bits available? {}\n", .{ q.bits * 3, has_data });
-                std.debug.print("  seek={d} end={d} bit_index={d}\n", .{ self.reader.reader.seek, self.reader.reader.end, self.reader.bit_index });
-                if (self.reader.reader.seek < self.reader.reader.end) {
-                    const bytes_to_show = @min(4, self.reader.reader.end - self.reader.reader.seek);
-                    std.debug.print("  Buffer bytes: ", .{});
-                    for (0..bytes_to_show) |i| {
-                        std.debug.print("0x{x:0>2} ", .{self.reader.reader.buffer[self.reader.reader.seek + i]});
-                    }
-                    std.debug.print("\n", .{});
-                }
-            }
-            // Resolve scalefactor
-            const sf_orig = sf;
             if (sf == 63) {
                 sf = 0;
             } else {
-                const shift: u5 = @intCast(@divTrunc(sf, 3));
+                const shift: u5 = @intCast(@divTrunc(sf, 3) | 0);
                 const base = scale_factor_base[@intCast(@mod(sf, 3))];
                 const rounding = (@as(i32, 1) << shift) >> 1;
                 const numerator = base + rounding;
                 sf = numerator >> shift;
-                if (self.samples_decoded == 0 and ch == 0 and sb < 2) {
-                    std.debug.print("SF: orig={d} shift={d} base={d} round={d} num={d} final={d}\n", .{ sf_orig, shift, base, rounding, numerator, sf });
-                }
             }
 
             // Decode samples
@@ -427,19 +409,7 @@ pub const Audio = struct {
                 sample[0] = @intCast(s0_raw);
                 sample[1] = @intCast(s1_raw);
                 sample[2] = @intCast(s2_raw);
-
-                if (self.samples_decoded == 0 and ch == 0 and sb == 0) {
-                    std.debug.print("RAW BITS READ: s0=0x{x} s1=0x{x} s2=0x{x} ({d} bits each)\n", .{ s0_raw, s1_raw, s2_raw, q.bits });
-                }
             }
-
-            // Debug first decode and track amplitudes
-            const pre0 = sample[0];
-            const pre1 = sample[1];
-            const pre2 = sample[2];
-            _ = pre0;
-            _ = pre1;
-            _ = pre2;
 
             // Postmultiply samples
             const scale = @divTrunc(65536, adj + 1);
@@ -792,5 +762,3 @@ fn idct36(s: [32][3]i32, ss: u32, d: []f32, dp: i32) void {
     d[base + 15] = t02;
     d[base + 16] = 0.0;
 }
-
-

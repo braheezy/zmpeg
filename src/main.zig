@@ -187,17 +187,10 @@ const AudioOutput = struct {
     allocator: std.mem.Allocator,
     device: sdl.AudioDevice,
     spec: sdl.AudioSpecResponse,
-    stream: ?sdl.AudioStream = null,
-    convert_buffer: []u8 = &[_]u8{},
+    start_threshold: usize,
     started: bool = false,
 
     fn deinit(self: *AudioOutput) void {
-        if (self.stream) |*stream| {
-            stream.free();
-        }
-        if (self.convert_buffer.len > 0) {
-            self.allocator.free(self.convert_buffer);
-        }
         self.device.close();
     }
 
@@ -205,34 +198,10 @@ const AudioOutput = struct {
         const expected_channels: usize = 2;
         const sample_count: usize = @intCast(samples.count);
         const source = std.mem.sliceAsBytes(samples.interleaved[0 .. sample_count * expected_channels]);
-
-        if (self.stream) |*stream| {
-            try stream.put(@constCast(source));
-
-            var available_bytes = stream.available();
-            while (available_bytes > 0) {
-                if (available_bytes > self.convert_buffer.len) {
-                    if (self.convert_buffer.len > 0) {
-                        self.allocator.free(self.convert_buffer);
-                    }
-                    self.convert_buffer = try self.allocator.alloc(u8, available_bytes);
-                }
-
-                const converted = try stream.get(self.convert_buffer[0..available_bytes]);
-                if (converted.len == 0) break;
-                try self.device.queueAudio(converted);
-                if (!self.started and self.device.getQueuedAudioSize() > 0) {
-                    self.device.pause(false);
-                    self.started = true;
-                }
-                available_bytes = stream.available();
-            }
-        } else {
-            try self.device.queueAudio(source);
-            if (!self.started and self.device.getQueuedAudioSize() > 0) {
-                self.device.pause(false);
-                self.started = true;
-            }
+        try self.device.queueAudio(source);
+        if (!self.started and self.device.getQueuedAudioSize() >= self.start_threshold) {
+            self.device.pause(false);
+            self.started = true;
         }
     }
 };
@@ -243,19 +212,10 @@ fn bytesPerSample(format: sdl.AudioFormat) usize {
 }
 
 fn initAudioOutput(allocator: std.mem.Allocator, sample_rate: u32) !AudioOutput {
-    // Ensure the SDL audio subsystem is ready before opening a device. This
-    // mirrors what the C reference does and prevents "Audio subsystem is not
-    // initialized" errors if SDL was started without the audio flag.
-    try sdl.initSubSystem(.{ .audio = true });
-
-    const desired_format = sdl.AudioFormat.f32;
-    const desired_channels: u8 = 2;
-    const desired_rate: i32 = @intCast(sample_rate);
-
     const desired_spec: sdl.AudioSpecRequest = .{
         .sample_rate = @intCast(sample_rate),
-        .buffer_format = desired_format,
-        .channel_count = desired_channels,
+        .buffer_format = sdl.AudioFormat.f32,
+        .channel_count = 2,
         .buffer_size_in_frames = 4096,
         .callback = null,
         .userdata = null,
@@ -263,48 +223,29 @@ fn initAudioOutput(allocator: std.mem.Allocator, sample_rate: u32) !AudioOutput 
 
     const result = sdl.openAudioDevice(.{
         .desired_spec = desired_spec,
-        .allowed_changes_from_desired = .{
-            .sample_rate = true,
-            .buffer_format = true,
-            .channel_count = true,
-            .buffer_size = true,
-        },
     }) catch |err| {
         std.debug.print("Failed to open audio device: {}\n", .{err});
         return err;
     };
 
+    std.debug.print(
+        "SDL audio device: freq={d} format={any} channels={d}\n",
+        .{ result.obtained_spec.sample_rate, result.obtained_spec.buffer_format, result.obtained_spec.channel_count },
+    );
+
     var output = AudioOutput{
         .allocator = allocator,
         .device = result.device,
         .spec = result.obtained_spec,
-        .stream = null,
-        .convert_buffer = &[_]u8{},
+        .start_threshold = 0,
     };
 
     errdefer output.deinit();
 
-    const use_stream = !meta.eql(result.obtained_spec.buffer_format, desired_format) or
-        result.obtained_spec.channel_count != desired_channels or
-        result.obtained_spec.sample_rate != desired_rate;
-
-    if (use_stream) {
-        output.stream = try sdl.newAudioStream(
-            desired_format,
-            desired_channels,
-            desired_rate,
-            result.obtained_spec.buffer_format,
-            result.obtained_spec.channel_count,
-            result.obtained_spec.sample_rate,
-        );
-
-        // Allocate a scratch buffer sized for one decoded frame worth of destination audio.
-        const dest_bytes_per_sample = bytesPerSample(result.obtained_spec.buffer_format);
-        const dest_channels = @as(usize, result.obtained_spec.channel_count);
-        const decoded_frames = @as(usize, zmpeg.SAMPLES_PER_FRAME);
-        const safety_factor: usize = 2; // give the resampler headroom
-        output.convert_buffer = try allocator.alloc(u8, decoded_frames * dest_channels * dest_bytes_per_sample * safety_factor);
-    }
+    const channels = @as(usize, result.obtained_spec.channel_count);
+    const bytes_per_sample = bytesPerSample(result.obtained_spec.buffer_format);
+    const frames = @as(usize, @max(result.obtained_spec.buffer_size_in_frames, 2048));
+    output.start_threshold = frames * channels * bytes_per_sample;
 
     output.device.pause(true);
 
@@ -383,12 +324,15 @@ pub fn main() !void {
     var texture_ready = false;
     var dest_rect: sdl.Rectangle = undefined;
 
+    var sdl_initialized = false;
+    defer if (sdl_initialized) sdl.quit();
+
     if (need_sdl) {
         try sdl.init(.{
             .video = need_video,
             .audio = enable_audio_playback,
         });
-        defer sdl.quit();
+        sdl_initialized = true;
 
         if (need_video) video_init: {
             const created_window = sdl.createWindow(
@@ -521,11 +465,6 @@ pub fn main() !void {
                         const frame_view: *const zmpeg.Frame = @ptrCast(frame);
                         frameToBgr(frame_view, frame_buffer, row_stride);
 
-                        std.debug.print(
-                            "Uploading RGB frame: stride={d} buffer_len={d}\n",
-                            .{ row_stride, frame_buffer.len },
-                        );
-
                         texture.update(frame_buffer, row_stride, null) catch |err| {
                             const sdl_err = sdl.getError() orelse "unknown";
                             std.debug.print("Warning: texture update failed ({}): {s}; disabling video.\n", .{ err, sdl_err });
@@ -632,9 +571,6 @@ pub fn main() !void {
                         };
 
                         renderer.present();
-
-                        // Small delay to control playback speed (roughly 25 FPS)
-                        sdl.delay(40);
                     }
                     continue;
                 }
