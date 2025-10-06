@@ -4,11 +4,13 @@ const types = @import("types.zig");
 const bitreader_mod = @import("bitreader.zig");
 const demux_mod = @import("demux.zig");
 const mpeg_mod = @import("mpeg.zig");
+const audio_mod = @import("audio.zig");
 
 pub const BitReader = bitreader_mod.BitReader;
 pub const Demux = demux_mod.Demux;
 
 pub const Mpeg = mpeg_mod.Mpeg;
+pub const Audio = audio_mod.Audio;
 
 pub fn createFromFile(allocator: std.mem.Allocator, path: []const u8) !*Mpeg {
     const reader_ptr = try allocator.create(BitReader);

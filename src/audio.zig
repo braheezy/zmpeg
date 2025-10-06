@@ -330,14 +330,15 @@ pub const Audio = struct {
                         idct36(self.sample[ch], @intCast(p), self.V[ch][0..], @intCast(self.v_pos));
 
                         // Build U, windowing, calculate output
-                        @memset(&self.U, 0);
+                        @memset(&self.U, @as(f32, 0.0));
 
                         var d_index: i32 = 512 - (self.v_pos >> 1);
                         var v_index: i32 = (@mod(self.v_pos, 128)) >> 1;
                         while (v_index < 1024) {
                             for (0..32) |i| {
-                                const accum = @as(f64, self.U[i]) + @as(f64, self.D[@intCast(d_index)]) * @as(f64, self.V[ch][@intCast(v_index)]);
-                                self.U[i] = @floatCast(accum);
+                                const d_val: f32 = self.D[@intCast(d_index)];
+                                const v_val: f32 = self.V[ch][@intCast(v_index)];
+                                self.U[i] += d_val * v_val;
                                 d_index += 1;
                                 v_index += 1;
                             }
@@ -350,8 +351,9 @@ pub const Audio = struct {
                         v_index = (128 - 32 + 1024) - v_index;
                         while (v_index < 1024) {
                             for (0..32) |i| {
-                                const accum = @as(f64, self.U[i]) + @as(f64, self.D[@intCast(d_index)]) * @as(f64, self.V[ch][@intCast(v_index)]);
-                                self.U[i] = @floatCast(accum);
+                                const d_val: f32 = self.D[@intCast(d_index)];
+                                const v_val: f32 = self.V[ch][@intCast(v_index)];
+                                self.U[i] += d_val * v_val;
                                 d_index += 1;
                                 v_index += 1;
                             }
@@ -362,12 +364,12 @@ pub const Audio = struct {
 
                         if (self.use_interleaved) {
                             for (0..32) |j| {
-                                self.samples.interleaved[((out_pos + j) << 1) + ch] = self.U[j] / -1090519040.0;
+                                self.samples.interleaved[((out_pos + j) << 1) + ch] = self.U[j] * audio_sample_scale;
                             }
                         } else {
                             const out_channel = if (ch == 0) &self.samples.left else &self.samples.right;
                             for (0..32) |j| {
-                                out_channel[out_pos + j] = self.U[j] / -1090519040.0;
+                                out_channel[out_pos + j] = self.U[j] * audio_sample_scale;
                             }
                         }
                     } // End of synthesis channel loop
@@ -515,6 +517,8 @@ pub const QuantizerSpec = struct {
     group: u8 = 0,
     bits: u8 = 0,
 };
+
+const audio_sample_scale: f32 = @as(f32, -1.0 / 1090519040.0);
 
 const frame_sync = 0x7ff;
 const mpeg_2_5 = 0x0;

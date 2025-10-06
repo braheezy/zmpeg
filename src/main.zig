@@ -3,6 +3,7 @@ const meta = std.meta;
 const builtin = @import("builtin");
 const zmpeg = @import("zmpeg");
 const sdl = @import("sdl2");
+const BitReader = zmpeg.BitReader;
 
 var debug_allocator: std.heap.DebugAllocator(.{}) = .init;
 
@@ -213,6 +214,95 @@ const AudioOutput = struct {
     }
 };
 
+const PumpResult = struct {
+    need_more_audio: bool = false,
+    test_done: bool = false,
+};
+
+fn pumpAudio(
+    audio_decoder: *zmpeg.Audio,
+    reader: *BitReader,
+    audio_output: ?*AudioOutput,
+    audio_dump_file: ?*std.fs.File,
+    audio_dump_path: ?[]const u8,
+    test_audio_packets: ?usize,
+    audio_packet_count: *usize,
+    log_audio: bool,
+) PumpResult {
+    var result = PumpResult{};
+
+    while (true) {
+        const maybe_samples = audio_decoder.decode() catch |err| {
+            std.debug.print("Audio decode error: {}\n", .{err});
+            break;
+        };
+        if (maybe_samples) |samples| {
+            if (audio_dump_file) |file| {
+                const bytes = std.mem.sliceAsBytes(samples.interleaved[0 .. samples.count * 2]);
+                file.writeAll(bytes) catch |err| {
+                    std.debug.print("Failed to write audio dump: {}\n", .{err});
+                };
+            }
+
+            var queued_after: usize = 0;
+            if (audio_output) |output| {
+                queued_after = output.queue(samples) catch |err| {
+                    std.debug.print("Failed to queue audio: {}\n", .{err});
+                    return result;
+                };
+                if (audio_dump_path == null) {
+                    result.need_more_audio = output.needsMoreAudio();
+                }
+            }
+
+            if (test_audio_packets != null) {
+                const sample_bytes = std.mem.sliceAsBytes(samples.interleaved[0 .. samples.count * 2]);
+                const packet_hash = hashFrame(fnv_offset_basis, sample_bytes);
+                std.debug.print("Zig audio packet {d} time={d:.6} hash={x:0>16}\n", .{ audio_packet_count.*, samples.time, packet_hash });
+                audio_packet_count.* += 1;
+                if (audio_packet_count.* >= test_audio_packets.?) {
+                    std.debug.print("audio packets decoded: {d}\n", .{audio_packet_count.*});
+                    result.test_done = true;
+                    break;
+                }
+            }
+
+            if (log_audio) {
+                const buffered = reader.reader.end - reader.reader.seek;
+                std.debug.print(
+                    "audio pump: queued={d} need_more={} buffered={d}\n",
+                    .{ queued_after, result.need_more_audio, buffered },
+                );
+            }
+
+            if (audio_output != null and audio_dump_path == null and !result.need_more_audio) {
+                break;
+            }
+        } else break;
+    }
+
+    reader.discardReadBytes();
+
+    if (audio_output) |output| {
+        if (audio_dump_path == null) {
+            result.need_more_audio = output.needsMoreAudio();
+            if (log_audio) {
+                const queued = output.device.getQueuedAudioSize();
+                const buffered = reader.reader.end - reader.reader.seek;
+                std.debug.print(
+                    "audio queue: queued={d} need_more={} buffered={d}\n",
+                    .{ queued, result.need_more_audio, buffered },
+                );
+            }
+        }
+    } else if (log_audio) {
+        const buffered = reader.reader.end - reader.reader.seek;
+        std.debug.print("audio queue: queued=0 need_more={} buffered={d}\n", .{ result.need_more_audio, buffered });
+    }
+
+    return result;
+}
+
 fn bytesPerSample(format: sdl.AudioFormat) usize {
     const bits = @as(usize, format.sample_length_bits);
     return (bits + 7) / 8;
@@ -283,6 +373,7 @@ pub fn main() !void {
     var audio_dump_path: ?[]const u8 = null;
     var capture_audio_frame: ?usize = null;
     var capture_audio_prefix: ?[]const u8 = null;
+    var log_audio_state = false;
 
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
@@ -307,6 +398,8 @@ pub fn main() !void {
             capture_audio_prefix = arg["--capture-audio-prefix=".len..];
         } else if (std.mem.eql(u8, arg, "--test-pattern")) {
             run_test_pattern = true;
+        } else if (std.mem.eql(u8, arg, "--log-audio")) {
+            log_audio_state = true;
         }
     }
 
@@ -339,8 +432,8 @@ pub fn main() !void {
     var need_video = test_audio_packets == null;
     const need_sdl = need_video or enable_audio_playback;
 
-    const window_width = 800;
-    const window_height = 600;
+    const window_width: usize = @as(usize, @intCast(width));
+    const window_height: usize = @as(usize, @intCast(height));
     var dummy_buffer: [1]u8 = .{0};
     var frame_buffer: []u8 = dummy_buffer[0..];
     var row_stride: usize = 0;
@@ -351,7 +444,12 @@ pub fn main() !void {
     var window_ready = false;
     var renderer_ready = false;
     var texture_ready = false;
-    var dest_rect: sdl.Rectangle = undefined;
+    const dest_rect: sdl.Rectangle = .{
+        .x = 0,
+        .y = 0,
+        .width = width,
+        .height = height,
+    };
 
     var sdl_initialized = false;
     defer if (sdl_initialized) sdl.quit();
@@ -423,8 +521,6 @@ pub fn main() !void {
                 }
             }
 
-            dest_rect = calculateAspectRatioRect(window_width, window_height, @intCast(width), @intCast(height));
-
             row_stride = @as(usize, @intCast(width)) * 3;
             const frame_size = @as(usize, @intCast(height)) * row_stride;
             frame_buffer = allocator.alloc(u8, frame_size) catch |err| {
@@ -470,26 +566,48 @@ pub fn main() !void {
 
         var demux_done = false;
 
-    while (running) {
-        // Handle events (skip in test mode)
-        if (test_audio_packets == null) {
-            while (sdl.pollEvent()) |ev| {
-                switch (ev) {
-                    .quit => running = false,
+        while (running) {
+            // Handle events (skip in test mode)
+            if (test_audio_packets == null) {
+                while (sdl.pollEvent()) |ev| {
+                    switch (ev) {
+                        .quit => running = false,
                         .key_down => |key| {
                             if (key.scancode == .escape) {
                                 running = false;
                             }
                         },
                         else => {},
+                    }
                 }
             }
-        }
 
-        const audio_queue_low = if (audio_output) |*output| output.needsMoreAudio() else false;
+            var skip_video = false;
+            if (enable_audio_playback) {
+                if (mpeg.audio_decoder) |audio_decoder| {
+                    if (mpeg.audio_reader) |audio_reader| {
+                        if (audio_output) |*output_ref| {
+                            if (output_ref.needsMoreAudio()) {
+                                const pump = pumpAudio(
+                                    audio_decoder,
+                                    audio_reader,
+                                    output_ref,
+                                    if (audio_dump_file) |*file| file else null,
+                                    audio_dump_path,
+                                    test_audio_packets,
+                                    &audio_packet_count,
+                                    log_audio_state,
+                                );
+                                if (pump.test_done) return;
+                                skip_video = pump.need_more_audio;
+                            }
+                        }
+                    }
+                }
+            }
 
-        // Try to decode a frame (skip rendering in test mode)
-        const maybe_frame = if (!audio_queue_low) video_decoder.decode() else null;
+            // Try to decode a frame (skip rendering in test mode)
+            const maybe_frame = if (need_video and !skip_video) video_decoder.decode() else null;
             if (need_video) {
                 if (maybe_frame) |frame| {
                     if (test_audio_packets == null) {
@@ -657,42 +775,18 @@ pub fn main() !void {
                                 }
                             }
 
-                            var need_more_audio = false;
-                            while (true) {
-                                const maybe_samples = audio_decoder.decode() catch |err| {
-                                    std.debug.print("Audio decode error: {}\n", .{err});
-                                    break;
-                                };
-                                if (maybe_samples) |samples| {
-                                    if (audio_dump_file) |*file| {
-                                        const bytes = std.mem.sliceAsBytes(samples.interleaved[0 .. samples.count * 2]);
-                                        file.writeAll(bytes) catch |err| {
-                                            std.debug.print("Failed to write audio dump: {}\n", .{err});
-                                        };
-                                    }
-                                    if (audio_output) |*output| {
-                                        _ = output.queue(samples) catch |err| {
-                                            std.debug.print("Failed to queue audio: {}\n", .{err});
-                                        };
-                                        if (audio_dump_path == null) {
-                                            need_more_audio = output.needsMoreAudio();
-                                        }
-                                    }
-                                    if (test_audio_packets != null) {
-                                        const sample_bytes = std.mem.sliceAsBytes(samples.interleaved[0 .. samples.count * 2]);
-                                        const packet_hash = hashFrame(fnv_offset_basis, sample_bytes);
-                                        std.debug.print("Zig audio packet {d} time={d:.6} hash={x:0>16}\n", .{ audio_packet_count, samples.time, packet_hash });
-                                        audio_packet_count += 1;
-                                        if (audio_packet_count >= test_audio_packets.?) {
-                                            std.debug.print("audio packets decoded: {d}\n", .{audio_packet_count});
-                                            return;
-                                        }
-                                    }
-                                } else break;
-                            }
-
-                            reader.discardReadBytes();
-                            if (need_more_audio) {
+                            const pump = pumpAudio(
+                                audio_decoder,
+                                reader,
+                                if (audio_output) |*output| output else null,
+                                if (audio_dump_file) |*file| file else null,
+                                audio_dump_path,
+                                test_audio_packets,
+                                &audio_packet_count,
+                                log_audio_state,
+                            );
+                            if (pump.test_done) return;
+                            if (pump.need_more_audio) {
                                 continue;
                             }
                         }
@@ -700,7 +794,6 @@ pub fn main() !void {
                 }
             }
         }
-
     }
 
     std.debug.print("Playback complete.\n", .{});
