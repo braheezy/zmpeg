@@ -3,6 +3,7 @@ const meta = std.meta;
 const builtin = @import("builtin");
 const zmpeg = @import("zmpeg");
 const sdl = @import("sdl2");
+const c = sdl.c;
 const BitReader = zmpeg.BitReader;
 
 var debug_allocator: std.heap.DebugAllocator(.{}) = .init;
@@ -19,91 +20,6 @@ fn hashFrame(hash: u64, data: []const u8) u64 {
         h *%= fnv_prime;
     }
     return h;
-}
-
-fn clampToU8(value: i32) u8 {
-    if (value < 0) return 0;
-    if (value > 255) return 255;
-    return @intCast(value);
-}
-
-fn frameToBgr(frame: *const zmpeg.Frame, dest: []u8, row_stride: usize) void {
-    const width = @as(usize, frame.width);
-    const height = @as(usize, frame.height);
-    if (height == 0 or width == 0) return;
-    if (dest.len < row_stride * height) return;
-
-    const cols = width >> 1;
-    const rows = height >> 1;
-    const yw = @as(i32, @intCast(frame.y.width));
-    const cw = @as(i32, @intCast(frame.cb.width));
-
-    const y_data = frame.y.data;
-    const cr_data = frame.cr.data;
-    const cb_data = frame.cb.data;
-
-    var row: usize = 0;
-    while (row < rows) : (row += 1) {
-        var c_index: usize = row * @as(usize, @intCast(cw));
-        var y_index: usize = row * 2 * @as(usize, @intCast(yw));
-        var d_index: usize = row * 2 * row_stride;
-
-        var col: usize = 0;
-        while (col < cols) : (col += 1) {
-            if (c_index >= cr_data.len or c_index >= cb_data.len) break;
-
-            const cr = @as(i32, cr_data[c_index]) - 128;
-            const cb = @as(i32, cb_data[c_index]) - 128;
-            const r = (cr * 104_597) >> 16;
-            const g = (cb * 25_674 + cr * 53_278) >> 16;
-            const b = (cb * 132_201) >> 16;
-
-            const y_stride_usize = @as(usize, @intCast(yw));
-
-            if (y_index < y_data.len) {
-                const yy0 = ((@as(i32, y_data[y_index]) - 16) * 76_309) >> 16;
-                if (d_index + 2 < dest.len) {
-                    dest[d_index + 2] = clampToU8(yy0 + r);
-                    dest[d_index + 1] = clampToU8(yy0 - g);
-                    dest[d_index + 0] = clampToU8(yy0 + b);
-                }
-            }
-
-            if (y_index + 1 < y_data.len) {
-                const yy1 = ((@as(i32, y_data[y_index + 1]) - 16) * 76_309) >> 16;
-                const dst1 = d_index + 3;
-                if (dst1 + 2 < dest.len) {
-                    dest[dst1 + 2] = clampToU8(yy1 + r);
-                    dest[dst1 + 1] = clampToU8(yy1 - g);
-                    dest[dst1 + 0] = clampToU8(yy1 + b);
-                }
-            }
-
-            if (y_index + y_stride_usize < y_data.len) {
-                const yy2 = ((@as(i32, y_data[y_index + y_stride_usize]) - 16) * 76_309) >> 16;
-                const dst2 = d_index + row_stride;
-                if (dst2 + 2 < dest.len) {
-                    dest[dst2 + 2] = clampToU8(yy2 + r);
-                    dest[dst2 + 1] = clampToU8(yy2 - g);
-                    dest[dst2 + 0] = clampToU8(yy2 + b);
-                }
-            }
-
-            if (y_index + y_stride_usize + 1 < y_data.len) {
-                const yy3 = ((@as(i32, y_data[y_index + y_stride_usize + 1]) - 16) * 76_309) >> 16;
-                const dst3 = d_index + row_stride + 3;
-                if (dst3 + 2 < dest.len) {
-                    dest[dst3 + 2] = clampToU8(yy3 + r);
-                    dest[dst3 + 1] = clampToU8(yy3 - g);
-                    dest[dst3 + 0] = clampToU8(yy3 + b);
-                }
-            }
-
-            c_index += 1;
-            y_index += 2;
-            d_index += 6;
-        }
-    }
 }
 
 fn runTestPattern(allocator: std.mem.Allocator) !void {
@@ -190,7 +106,10 @@ const AudioOutput = struct {
     spec: sdl.AudioSpecResponse,
     start_threshold_bytes: usize,
     min_queue_bytes: usize,
+    bytes_per_frame: usize,
+    lead_seconds: f64,
     started: bool = false,
+    sample_rate: usize,
 
     fn deinit(self: *AudioOutput) void {
         self.device.close();
@@ -212,10 +131,25 @@ const AudioOutput = struct {
     fn needsMoreAudio(self: *AudioOutput) bool {
         return self.device.getQueuedAudioSize() < self.min_queue_bytes;
     }
+
+    fn queuedSeconds(self: *AudioOutput) f64 {
+        if (self.bytes_per_frame == 0 or self.sample_rate == 0) return 0;
+        const queued_bytes = self.device.getQueuedAudioSize();
+        const queued_f = @as(f64, @floatFromInt(queued_bytes));
+        const frame_bytes_f = @as(f64, @floatFromInt(self.bytes_per_frame));
+        const frames = queued_f / frame_bytes_f;
+        return frames / @as(f64, @floatFromInt(self.sample_rate));
+    }
+
+    fn leadTime(self: *const AudioOutput) f64 {
+        return self.lead_seconds;
+    }
 };
 
 const PumpResult = struct {
     need_more_audio: bool = false,
+    need_more_data: bool = false,
+    decoded_samples: bool = false,
     test_done: bool = false,
 };
 
@@ -228,15 +162,24 @@ fn pumpAudio(
     test_audio_packets: ?usize,
     audio_packet_count: *usize,
     log_audio: bool,
+    target_time: ?f64,
 ) PumpResult {
     var result = PumpResult{};
+    var need_more_bits = false;
 
     while (true) {
+        if (target_time) |limit| {
+            if (audio_decoder.time >= limit and (audio_output == null or !audio_output.?.needsMoreAudio())) {
+                break;
+            }
+        }
+
         const maybe_samples = audio_decoder.decode() catch |err| {
             std.debug.print("Audio decode error: {}\n", .{err});
             break;
         };
         if (maybe_samples) |samples| {
+            result.decoded_samples = true;
             if (audio_dump_file) |file| {
                 const bytes = std.mem.sliceAsBytes(samples.interleaved[0 .. samples.count * 2]);
                 file.writeAll(bytes) catch |err| {
@@ -275,13 +218,22 @@ fn pumpAudio(
                 );
             }
 
-            if (audio_output != null and audio_dump_path == null and !result.need_more_audio) {
+            if (target_time) |limit| {
+                if (audio_decoder.time >= limit) break;
+            } else if (audio_output != null and audio_dump_path == null and !result.need_more_audio) {
                 break;
             }
-        } else break;
+        } else {
+            need_more_bits = true;
+            break;
+        }
     }
 
     reader.discardReadBytes();
+
+    if (need_more_bits) {
+        result.need_more_data = true;
+    }
 
     if (audio_output) |output| {
         if (audio_dump_path == null) {
@@ -336,20 +288,114 @@ fn initAudioOutput(allocator: std.mem.Allocator, sample_rate: u32) !AudioOutput 
         .spec = result.obtained_spec,
         .start_threshold_bytes = 0,
         .min_queue_bytes = 0,
+        .bytes_per_frame = 0,
+        .lead_seconds = 0,
+        .sample_rate = 0,
     };
 
     errdefer output.deinit();
 
     const channels = @as(usize, result.obtained_spec.channel_count);
     const bytes_per_sample = bytesPerSample(result.obtained_spec.buffer_format);
-    const frame_bytes: usize = zmpeg.SAMPLES_PER_FRAME * 2 * @sizeOf(f32);
-    output.start_threshold_bytes = frame_bytes * 2; // about 46ms at 44.1k
+    output.bytes_per_frame = channels * bytes_per_sample;
+    const frame_bytes: usize = zmpeg.SAMPLES_PER_FRAME * output.bytes_per_frame;
+    output.start_threshold_bytes = frame_bytes * 4; // ≈92ms at 44.1k to avoid early underruns
     const base_frames = @as(usize, @max(result.obtained_spec.buffer_size_in_frames, 2048));
-    output.min_queue_bytes = @max(frame_bytes * 4, base_frames * channels * bytes_per_sample);
+    output.min_queue_bytes = @max(frame_bytes * 6, base_frames * channels * bytes_per_sample);
+    output.sample_rate = if (result.obtained_spec.sample_rate > 0)
+        @as(usize, @intCast(result.obtained_spec.sample_rate))
+    else
+        @as(usize, @intCast(sample_rate));
+
+    if (output.bytes_per_frame > 0 and output.sample_rate > 0) {
+        const rate_f = @as(f64, @floatFromInt(output.sample_rate));
+        const buffer_frames = @as(f64, @floatFromInt(result.obtained_spec.buffer_size_in_frames));
+        output.lead_seconds = if (buffer_frames > 0)
+            buffer_frames / rate_f
+        else
+            @as(f64, @floatFromInt(output.start_threshold_bytes)) /
+                (@as(f64, @floatFromInt(output.bytes_per_frame)) * rate_f);
+    } else {
+        output.lead_seconds = 0;
+    }
+    if (output.lead_seconds < 0.18) {
+        output.lead_seconds = 0.18;
+    }
 
     output.device.pause(true);
 
     return output;
+}
+
+fn computeAudioClock(audio_decoder: *zmpeg.Audio, audio_output: ?*AudioOutput) f64 {
+    const decoder_time = audio_decoder.time;
+    if (audio_output) |output| {
+        const queued = output.queuedSeconds();
+        if (decoder_time >= queued) {
+            return decoder_time - queued;
+        }
+        return 0;
+    }
+    return decoder_time;
+}
+
+fn feedPackets(
+    mpeg: *zmpeg.Mpeg,
+    want_video: bool,
+    want_audio: bool,
+    demux_done: *bool,
+) bool {
+    if (demux_done.* or (!want_video and !want_audio)) return false;
+
+    var need_video = want_video;
+    var need_audio = want_audio;
+
+    while (need_video or need_audio) {
+        const packet = mpeg.demux.decode() orelse {
+            demux_done.* = true;
+            if (mpeg.video_reader) |reader| reader.signalEnd();
+            if (mpeg.audio_reader) |reader| reader.signalEnd();
+            return false;
+        };
+
+        if (mpeg.video_packet_type) |ptype| {
+            if (packet.type == ptype) {
+                if (mpeg.video_reader) |reader| {
+                    reader.append(packet.data) catch |err| {
+                        std.debug.print("Failed to append video packet: {}\n", .{err});
+                        demux_done.* = true;
+                        return false;
+                    };
+                } else if (mpeg.video_decoder) |decoder| {
+                    decoder.reader.append(packet.data) catch |err| {
+                        std.debug.print("Failed to append video packet: {}\n", .{err});
+                        demux_done.* = true;
+                        return false;
+                    };
+                }
+                if (need_video) {
+                    need_video = false;
+                }
+            }
+        }
+
+        if (mpeg.audio_packet_type) |aptype| {
+            if (packet.type == aptype) {
+                if (mpeg.audio_reader) |reader| {
+                    reader.append(packet.data) catch |err| {
+                        std.debug.print("Failed to append audio packet: {}\n", .{err});
+                        demux_done.* = true;
+                        return false;
+                    };
+                }
+                if (need_audio) {
+                    need_audio = false;
+                }
+            }
+        }
+    }
+
+    return true;
 }
 
 pub fn main() !void {
@@ -374,6 +420,7 @@ pub fn main() !void {
     var capture_audio_frame: ?usize = null;
     var capture_audio_prefix: ?[]const u8 = null;
     var log_audio_state = false;
+    var log_sync_state = false;
 
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
@@ -400,6 +447,8 @@ pub fn main() !void {
             run_test_pattern = true;
         } else if (std.mem.eql(u8, arg, "--log-audio")) {
             log_audio_state = true;
+        } else if (std.mem.eql(u8, arg, "--log-sync")) {
+            log_sync_state = true;
         }
     }
 
@@ -434,10 +483,6 @@ pub fn main() !void {
 
     const window_width: usize = @as(usize, @intCast(width));
     const window_height: usize = @as(usize, @intCast(height));
-    var dummy_buffer: [1]u8 = .{0};
-    var frame_buffer: []u8 = dummy_buffer[0..];
-    var row_stride: usize = 0;
-    var frame_buffer_allocated = false;
     var window: sdl.Window = undefined;
     var renderer: sdl.Renderer = undefined;
     var texture: sdl.Texture = undefined;
@@ -492,7 +537,7 @@ pub fn main() !void {
 
             const created_texture = sdl.createTexture(
                 renderer,
-                .rgb24,
+                .iyuv,
                 .streaming,
                 @intCast(width),
                 @intCast(height),
@@ -520,28 +565,12 @@ pub fn main() !void {
                     std.debug.print("Failed to query texture info: {}\n", .{err});
                 }
             }
-
-            row_stride = @as(usize, @intCast(width)) * 3;
-            const frame_size = @as(usize, @intCast(height)) * row_stride;
-            frame_buffer = allocator.alloc(u8, frame_size) catch |err| {
-                std.debug.print("Warning: failed to allocate video buffer ({}); disabling video.\n", .{err});
-                texture.destroy();
-                texture_ready = false;
-                renderer.destroy();
-                renderer_ready = false;
-                window.destroy();
-                window_ready = false;
-                need_video = false;
-                break :video_init;
-            };
-            frame_buffer_allocated = true;
         }
     }
 
     defer if (texture_ready) texture.destroy();
     defer if (renderer_ready) renderer.destroy();
     defer if (window_ready) window.destroy();
-    defer if (frame_buffer_allocated) allocator.free(frame_buffer);
 
     // Optional audio dump file
     var audio_dump_file: ?std.fs.File = null;
@@ -559,15 +588,22 @@ pub fn main() !void {
 
     var running = true;
     var audio_packet_count: usize = 0;
+    const max_tick_step: f64 = 1.0 / 30.0;
+    var playback_time: f64 = 0;
+    var last_ticks: u64 = sdl.getTicks64();
+    var last_video_time: f64 = 0;
+    var sync_log_accum: f64 = 0;
+    var dropped_frames: usize = 0;
+    const video_present_slack: f64 = 0.02;
+    const video_drop_margin: f64 = 0.5;
+    const video_decode_ahead: f64 = 0.6;
+    const audio_decode_ahead: f64 = 0.25;
+    var pending_frame: ?*const zmpeg.Frame = null;
 
     if (mpeg.video_decoder) |video_decoder| {
-        const video_reader = mpeg.video_reader;
-        const packet_type = mpeg.video_packet_type;
-
         var demux_done = false;
 
         while (running) {
-            // Handle events (skip in test mode)
             if (test_audio_packets == null) {
                 while (sdl.pollEvent()) |ev| {
                     switch (ev) {
@@ -582,41 +618,158 @@ pub fn main() !void {
                 }
             }
 
-            var skip_video = false;
-            if (enable_audio_playback) {
+            const current_ticks = sdl.getTicks64();
+            const delta_ticks = current_ticks - last_ticks;
+            last_ticks = current_ticks;
+            var elapsed = @as(f64, @floatFromInt(delta_ticks)) / 1000.0;
+            if (elapsed > max_tick_step) elapsed = max_tick_step;
+
+            const target_time = playback_time + elapsed;
+            var master_clock = target_time;
+            var audio_clock = playback_time;
+            var audio_lead: f64 = 0.1;
+
+            var decode_audio_failed = false;
+            var decode_video_failed = false;
+            var presented_frame = false;
+            var decoded_any = false;
+
+            if (mpeg.audio_decoder) |audio_decoder| {
+                if (audio_output) |*out| {
+                    audio_lead = out.leadTime();
+                }
+                const computed_clock = computeAudioClock(audio_decoder, if (audio_output) |*out| out else null);
+                audio_clock = computed_clock;
+            }
+
+            if (audio_output != null and audio_output.?.started and audio_clock > 0) {
+                master_clock = audio_clock;
+            }
+            if (master_clock < playback_time) {
+                master_clock = playback_time;
+            }
+
+            var audio_target_time = if (audio_output != null and audio_output.?.started)
+                master_clock + audio_lead + audio_decode_ahead
+            else
+                playback_time + audio_lead + audio_decode_ahead;
+            if (mpeg.audio_decoder != null and audio_output != null and audio_output.?.needsMoreAudio()) {
+                audio_target_time += audio_lead;
+            }
+            const present_threshold = if (audio_output != null and audio_output.?.started)
+                master_clock + video_present_slack
+            else
+                playback_time + video_present_slack;
+            const drop_threshold = if (audio_output != null and audio_output.?.started)
+                master_clock - video_drop_margin
+            else
+                playback_time - 0.1;
+            const decode_limit = if (audio_output != null and audio_output.?.started)
+                master_clock + video_decode_ahead
+            else
+                playback_time + video_decode_ahead;
+
+            while (true) {
+                var did_decode = false;
+                decode_audio_failed = false;
+                decode_video_failed = false;
+
                 if (mpeg.audio_decoder) |audio_decoder| {
-                    if (mpeg.audio_reader) |audio_reader| {
-                        if (audio_output) |*output_ref| {
-                            if (output_ref.needsMoreAudio()) {
-                                const pump = pumpAudio(
-                                    audio_decoder,
-                                    audio_reader,
-                                    output_ref,
-                                    if (audio_dump_file) |*file| file else null,
-                                    audio_dump_path,
-                                    test_audio_packets,
-                                    &audio_packet_count,
-                                    log_audio_state,
-                                );
-                                if (pump.test_done) return;
-                                skip_video = pump.need_more_audio;
+                    const need_more_audio = if (audio_output) |*out| out.needsMoreAudio() else false;
+                    if (audio_decoder.time < audio_target_time or need_more_audio) {
+                        const maybe_samples = audio_decoder.decode() catch |err| {
+                            std.debug.print("Audio decode error: {}\n", .{err});
+                            decode_audio_failed = true;
+                            break;
+                        };
+
+                        if (maybe_samples) |samples| {
+                            if (audio_dump_file) |file| {
+                                const bytes = std.mem.sliceAsBytes(samples.interleaved[0 .. samples.count * 2]);
+                                file.writeAll(bytes) catch |err| {
+                                    std.debug.print("Failed to write audio dump: {}\n", .{err});
+                                };
                             }
+
+                            if (enable_audio_playback and audio_output == null) {
+                                const sample_rate = audio_decoder.getSamplerate();
+                                if (sample_rate > 0) {
+                                    audio_output = initAudioOutput(allocator, sample_rate) catch |err| {
+                                        std.debug.print("Failed to initialise audio output: {}\n", .{err});
+                                        break;
+                                    };
+                                }
+                            }
+
+                            if (audio_output) |*output| {
+                                const queued_after = output.queue(samples) catch |err| {
+                                    std.debug.print("Failed to queue audio: {}\n", .{err});
+                                    running = false;
+                                    break;
+                                };
+                                if (log_audio_state) {
+                                    std.debug.print("audio queue enqueue queued={d}\n", .{queued_after});
+                                }
+                            }
+
+                            if (test_audio_packets) |limit| {
+                                const sample_bytes = std.mem.sliceAsBytes(samples.interleaved[0 .. samples.count * 2]);
+                                const packet_hash = hashFrame(fnv_offset_basis, sample_bytes);
+                                std.debug.print(
+                                    "Zig audio packet {d} time={d:.6} hash={x:0>16}\n",
+                                    .{ audio_packet_count, samples.time, packet_hash },
+                                );
+                                audio_packet_count += 1;
+                                if (audio_packet_count >= limit) {
+                                    std.debug.print("audio packets decoded: {d}\n", .{audio_packet_count});
+                                    return;
+                                }
+                            }
+
+                            did_decode = true;
+                            decoded_any = true;
+                            decode_audio_failed = false;
+                            if (mpeg.audio_reader) |audio_reader| {
+                                audio_reader.discardReadBytes();
+                            }
+
+                            if (audio_output) |*output| {
+                                _ = output;
+                            }
+                        } else {
+                            decode_audio_failed = true;
                         }
                     }
                 }
-            }
 
-            // Try to decode a frame (skip rendering in test mode)
-            const maybe_frame = if (need_video and !skip_video) video_decoder.decode() else null;
-            if (need_video) {
-                if (maybe_frame) |frame| {
-                    if (test_audio_packets == null) {
-                        const frame_view: *const zmpeg.Frame = @ptrCast(frame);
-                        frameToBgr(frame_view, frame_buffer, row_stride);
+                if (pending_frame) |frame_data| {
+                    if (frame_data.time < drop_threshold) {
+                        pending_frame = null;
+                        dropped_frames += 1;
+                        did_decode = true;
+                        decoded_any = true;
+                        continue;
+                    }
 
-                        texture.update(frame_buffer, row_stride, null) catch |err| {
+                    if (test_audio_packets == null and frame_data.time <= present_threshold) {
+                        const y_pitch: c_int = @intCast(frame_data.y.width);
+                        const cb_pitch: c_int = @intCast(frame_data.cb.width);
+                        const cr_pitch: c_int = @intCast(frame_data.cr.width);
+                        const y_ptr: [*c]const u8 = @ptrCast(frame_data.y.data.ptr);
+                        const cb_ptr: [*c]const u8 = @ptrCast(frame_data.cb.data.ptr);
+                        const cr_ptr: [*c]const u8 = @ptrCast(frame_data.cr.data.ptr);
+                        if (c.SDL_UpdateYUVTexture(
+                            texture.ptr,
+                            null,
+                            y_ptr,
+                            y_pitch,
+                            cb_ptr,
+                            cb_pitch,
+                            cr_ptr,
+                            cr_pitch,
+                        ) != 0) {
                             const sdl_err = sdl.getError() orelse "unknown";
-                            std.debug.print("Warning: texture update failed ({}): {s}; disabling video.\n", .{ err, sdl_err });
+                            std.debug.print("Warning: texture update failed: {s}; disabling video.\n", .{sdl_err});
                             if (texture_ready) {
                                 texture.destroy();
                                 texture_ready = false;
@@ -629,14 +782,10 @@ pub fn main() !void {
                                 window.destroy();
                                 window_ready = false;
                             }
-                            if (frame_buffer_allocated) {
-                                allocator.free(frame_buffer);
-                                frame_buffer_allocated = false;
-                                frame_buffer = dummy_buffer[0..];
-                            }
                             need_video = false;
-                            continue;
-                        };
+                            pending_frame = null;
+                            break;
+                        }
 
                         renderer.setColorRGB(0, 0, 0) catch |err| {
                             const sdl_err = sdl.getError() orelse "unknown";
@@ -656,13 +805,9 @@ pub fn main() !void {
                                 texture.destroy();
                                 texture_ready = false;
                             }
-                            if (frame_buffer_allocated) {
-                                allocator.free(frame_buffer);
-                                frame_buffer_allocated = false;
-                                frame_buffer = dummy_buffer[0..];
-                            }
                             need_video = false;
-                            continue;
+                            pending_frame = null;
+                            break;
                         };
 
                         renderer.clear() catch |err| {
@@ -683,13 +828,9 @@ pub fn main() !void {
                                 texture.destroy();
                                 texture_ready = false;
                             }
-                            if (frame_buffer_allocated) {
-                                allocator.free(frame_buffer);
-                                frame_buffer_allocated = false;
-                                frame_buffer = dummy_buffer[0..];
-                            }
                             need_video = false;
-                            continue;
+                            pending_frame = null;
+                            break;
                         };
 
                         renderer.copy(texture, null, dest_rect) catch |err| {
@@ -710,23 +851,83 @@ pub fn main() !void {
                                 texture.destroy();
                                 texture_ready = false;
                             }
-                            if (frame_buffer_allocated) {
-                                allocator.free(frame_buffer);
-                                frame_buffer_allocated = false;
-                                frame_buffer = dummy_buffer[0..];
-                            }
                             need_video = false;
-                            continue;
+                            pending_frame = null;
+                            break;
                         };
 
                         renderer.present();
+                        last_video_time = frame_data.time;
+                        pending_frame = null;
+                        presented_frame = true;
+                        did_decode = true;
+                        decoded_any = true;
+                        continue;
                     }
                 }
-            } else if (maybe_frame != null) {
-                // frame decoded but we do not need to present; allow audio/demux handling
+
+                if (need_video) {
+                    const should_decode = pending_frame == null and video_decoder.time <= decode_limit;
+                    if (should_decode) {
+                        const maybe_frame = video_decoder.decode();
+                        if (maybe_frame) |frame| {
+                            pending_frame = @ptrCast(frame);
+                            did_decode = true;
+                            decoded_any = true;
+                            decode_video_failed = false;
+                            continue;
+                        } else {
+                            decode_video_failed = true;
+                        }
+                    }
+                }
+
+                const need_video_packets = need_video and !demux_done and decode_video_failed;
+                const need_audio_packets = (mpeg.audio_decoder != null) and !demux_done and decode_audio_failed;
+                if (need_video_packets or need_audio_packets) {
+                    if (!feedPackets(mpeg, need_video_packets, need_audio_packets, &demux_done)) {
+                        break;
+                    }
+                    decode_video_failed = false;
+                    decode_audio_failed = false;
+                    continue;
+                }
+
+                if (!did_decode) {
+                    break;
+                }
             }
 
-            // If no frame available, try to get more data
+            playback_time = target_time;
+            sync_log_accum += elapsed;
+
+            if ((!need_video or decode_video_failed) and
+                (mpeg.audio_decoder == null or decode_audio_failed) and
+                demux_done)
+            {
+                running = false;
+                continue;
+            }
+
+            var current_master = master_clock;
+            if (mpeg.audio_decoder) |audio_decoder| {
+                audio_clock = computeAudioClock(audio_decoder, if (audio_output) |*out| out else null);
+                if (audio_output != null and audio_output.?.started and audio_clock > 0) {
+                    current_master = audio_clock;
+                }
+            }
+
+            playback_time = current_master;
+
+            if (log_sync_state and sync_log_accum >= 1.0) {
+                sync_log_accum = 0;
+                const queued_bytes = if (audio_output) |*out| out.device.getQueuedAudioSize() else 0;
+                std.debug.print(
+                    "sync: master={d:.3} video={d:.3} audio={d:.3} queued={d} dropped={d}\n",
+                    .{ current_master, last_video_time, audio_clock, queued_bytes, dropped_frames },
+                );
+            }
+
             if (demux_done) {
                 if (audio_output) |*output| {
                     const remaining = output.device.getQueuedAudioSize();
@@ -738,60 +939,9 @@ pub fn main() !void {
                 running = false;
                 continue;
             }
-            const packet = mpeg.demux.decode() orelse {
-                demux_done = true;
-                if (video_reader) |reader| {
-                    reader.signalEnd();
-                }
-                continue;
-            };
 
-            if (packet_type) |ptype| {
-                if (packet.type == ptype) {
-                    if (video_reader) |reader| {
-                        reader.append(packet.data) catch break;
-                    } else {
-                        video_decoder.reader.append(packet.data) catch break;
-                    }
-                }
-            }
-
-            // Handle audio packets
-            if (mpeg.audio_packet_type) |aptype| {
-                if (packet.type == aptype) {
-                    if (mpeg.audio_reader) |reader| {
-                        reader.append(packet.data) catch break;
-
-                        // Decode available audio frames
-                        if (mpeg.audio_decoder) |audio_decoder| {
-                            // One-time SDL audio device initialization
-                            if (enable_audio_playback and audio_output == null) {
-                                const sample_rate = audio_decoder.getSamplerate();
-                                if (sample_rate > 0) {
-                                    audio_output = initAudioOutput(allocator, sample_rate) catch |err| {
-                                        std.debug.print("Failed to initialise audio output: {}\n", .{err});
-                                        break;
-                                    };
-                                }
-                            }
-
-                            const pump = pumpAudio(
-                                audio_decoder,
-                                reader,
-                                if (audio_output) |*output| output else null,
-                                if (audio_dump_file) |*file| file else null,
-                                audio_dump_path,
-                                test_audio_packets,
-                                &audio_packet_count,
-                                log_audio_state,
-                            );
-                            if (pump.test_done) return;
-                            if (pump.need_more_audio) {
-                                continue;
-                            }
-                        }
-                    }
-                }
+            if (!presented_frame and !decoded_any) {
+                sdl.delay(1);
             }
         }
     }
