@@ -675,8 +675,11 @@ pub fn main() !void {
                 decode_video_failed = false;
 
                 if (mpeg.audio_decoder) |audio_decoder| {
-                    const need_more_audio = if (audio_output) |*out| out.needsMoreAudio() else false;
-                    if (audio_decoder.time < audio_target_time or need_more_audio) {
+                    while (true) {
+                        const queued_ok = if (audio_output) |*out| out.device.getQueuedAudioSize() >= out.min_queue_bytes else true;
+                        const need_more_audio = if (audio_output) |*out| out.needsMoreAudio() else false;
+                        if (!(audio_decoder.time < audio_target_time or need_more_audio or !queued_ok)) break;
+
                         const maybe_samples = audio_decoder.decode() catch |err| {
                             std.debug.print("Audio decode error: {}\n", .{err});
                             decode_audio_failed = true;
@@ -701,8 +704,9 @@ pub fn main() !void {
                                 }
                             }
 
+                            var queued_after: usize = 0;
                             if (audio_output) |*output| {
-                                const queued_after = output.queue(samples) catch |err| {
+                                queued_after = output.queue(samples) catch |err| {
                                     std.debug.print("Failed to queue audio: {}\n", .{err});
                                     running = false;
                                     break;
@@ -734,10 +738,15 @@ pub fn main() !void {
                             }
 
                             if (audio_output) |*output| {
-                                _ = output;
+                                if (output.device.getQueuedAudioSize() >= output.min_queue_bytes and audio_decoder.time >= audio_target_time) {
+                                    break;
+                                }
+                            } else {
+                                break;
                             }
                         } else {
                             decode_audio_failed = true;
+                            break;
                         }
                     }
                 }
@@ -786,52 +795,6 @@ pub fn main() !void {
                             pending_frame = null;
                             break;
                         }
-
-                        renderer.setColorRGB(0, 0, 0) catch |err| {
-                            const sdl_err = sdl.getError() orelse "unknown";
-                            std.debug.print(
-                                "Warning: renderer setColor failed ({}): {s}; disabling video.\n",
-                                .{ err, sdl_err },
-                            );
-                            if (renderer_ready) {
-                                renderer.destroy();
-                                renderer_ready = false;
-                            }
-                            if (window_ready) {
-                                window.destroy();
-                                window_ready = false;
-                            }
-                            if (texture_ready) {
-                                texture.destroy();
-                                texture_ready = false;
-                            }
-                            need_video = false;
-                            pending_frame = null;
-                            break;
-                        };
-
-                        renderer.clear() catch |err| {
-                            const sdl_err = sdl.getError() orelse "unknown";
-                            std.debug.print(
-                                "Warning: renderer clear failed ({}): {s}; disabling video.\n",
-                                .{ err, sdl_err },
-                            );
-                            if (renderer_ready) {
-                                renderer.destroy();
-                                renderer_ready = false;
-                            }
-                            if (window_ready) {
-                                window.destroy();
-                                window_ready = false;
-                            }
-                            if (texture_ready) {
-                                texture.destroy();
-                                texture_ready = false;
-                            }
-                            need_video = false;
-                            pending_frame = null;
-                            break;
-                        };
 
                         renderer.copy(texture, null, dest_rect) catch |err| {
                             const sdl_err = sdl.getError() orelse "unknown";
