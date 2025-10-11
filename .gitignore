@@ -1,6 +1,7 @@
 pl_mpeg
 *.md
 *.mp4
+!trouble-pogo.mp4
 !README.md
 .zig-global-cache
 my-SDL.zig
