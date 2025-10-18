@@ -35,31 +35,13 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("tools/audio_dump.zig"),
             .target = target,
             .optimize = optimize,
-            .imports = &.{ .{ .name = "zmpeg", .module = mod } },
+            .imports = &.{.{ .name = "zmpeg", .module = mod }},
         }),
     });
     b.installArtifact(dump_exe);
 
     const dump_step = b.step("audio-dump", "Build audio dump utility");
     dump_step.dependOn(&dump_exe.step);
-
-    // SDL audio test
-    const test_exe = b.addExecutable(.{
-        .name = "test_sdl_audio",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("test_sdl_audio.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-    test_exe.root_module.addImport("sdl2", sdk.getWrapperModule());
-    sdk.link(test_exe, .static, sdl.Library.SDL2);
-    b.installArtifact(test_exe);
-
-    const test_run_step = b.step("test-audio", "Test SDL audio");
-    const test_run_cmd = b.addRunArtifact(test_exe);
-    test_run_step.dependOn(&test_run_cmd.step);
-    test_run_cmd.step.dependOn(b.getInstallStep());
 
     const run_step = b.step("run", "Run the app");
 
