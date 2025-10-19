@@ -7,3 +7,4 @@ pl_mpeg
 my-SDL.zig
 *.raw
 *.log
+*.mpg

@@ -29,20 +29,6 @@ pub fn build(b: *std.Build) void {
 
     b.installArtifact(exe);
 
-    const dump_exe = b.addExecutable(.{
-        .name = "audio_dump",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("tools/audio_dump.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{.{ .name = "zmpeg", .module = mod }},
-        }),
-    });
-    b.installArtifact(dump_exe);
-
-    const dump_step = b.step("audio-dump", "Build audio dump utility");
-    dump_step.dependOn(&dump_exe.step);
-
     const run_step = b.step("run", "Run the app");
 
     const run_cmd = b.addRunArtifact(exe);
