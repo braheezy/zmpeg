@@ -3,7 +3,7 @@ const sdl = @import("sdl");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
-    const optimize = b.standardOptimizeOption(.{});
+    const optimize = std.builtin.OptimizeMode.ReleaseFast;
 
     const sdk = sdl.init(b, .{});
 

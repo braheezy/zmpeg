@@ -25,9 +25,15 @@ pub fn createFromFile(allocator: std.mem.Allocator, path: []const u8) !*Mpeg {
 }
 
 pub fn createFromMemory(allocator: std.mem.Allocator, data: []const u8) !*Mpeg {
-    var reader = BitReader.initFromMemory(allocator, data);
-    errdefer reader.deinit();
-    return try Mpeg.init(allocator, &reader);
+    const reader_ptr = try allocator.create(BitReader);
+    errdefer allocator.destroy(reader_ptr);
+
+    reader_ptr.* = BitReader.initFromMemory(allocator, data);
+    errdefer reader_ptr.deinit();
+
+    const mpeg = try Mpeg.init(allocator, reader_ptr);
+    mpeg.owns_source_reader = true;
+    return mpeg;
 }
 
 pub fn createWithReader(allocator: std.mem.Allocator, reader: *BitReader) !*Mpeg {
