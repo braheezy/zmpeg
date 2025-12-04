@@ -5,9 +5,7 @@ MPEG-1 Video decoder, MP2 Audio decoder, MPEG-PS demuxer in Zig. Port of [pl_mpe
 ## Quick Start
 
 ```bash
-zig build
-ffmpeg -i video.mp4 -q:v 2 -q:a 2 -f mpeg video.mpg
-./zig-out/bin/player video.mpg
+zig build run -- trouble-pogo.mp4
 ```
 
 ## Library Usage
