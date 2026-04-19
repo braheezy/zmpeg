@@ -2,11 +2,11 @@
     .name = .zmpeg,
     .version = "0.0.0",
     .fingerprint = 0x23a123e4c982a9c1, // Changing this has security and trust implications.
-    .minimum_zig_version = "0.15.1",
+    .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .sdl = .{
-            .url = "git+https://github.com/ikskuh/SDL.zig#a7e95b5fcc5b0d68921c148778609d2fe248c3d8",
-            .hash = "SDL2-0.0.0-yMCQivWqBABTfB8opAADsLCGxxu20vijLBW2hHdpTR-L",
+            .url = "git+https://github.com/braheezy/SDL.zig#a1c36303a95c37ba36c69b19f79683f2eb5050b4",
+            .hash = "SDL2-0.0.0-yMCQipWnBABMAdfue6YmerIoyHg-6r3f3zapmQoy9teu",
         },
     },
     .paths = .{

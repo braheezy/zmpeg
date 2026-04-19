@@ -11,6 +11,7 @@ pub const DebugCapture = struct {
 
 pub const Audio = struct {
     allocator: std.mem.Allocator,
+    io: std.Io,
     time: f64 = 0,
     samples_decoded: u32 = 0,
     samplerate_index: u8 = 3,
@@ -38,10 +39,11 @@ pub const Audio = struct {
 
     debug_capture: ?DebugCapture = null,
 
-    pub fn init(allocator: std.mem.Allocator, reader: *BitReader, use_interleaved: bool) !*Audio {
+    pub fn init(allocator: std.mem.Allocator, io: std.Io, reader: *BitReader, use_interleaved: bool) !*Audio {
         const self = try allocator.create(Audio);
         self.* = .{
             .allocator = allocator,
+            .io = io,
             .reader = reader,
             .samples = try allocator.create(types.Samples),
             .allocation = undefined,
@@ -481,34 +483,38 @@ pub const Audio = struct {
     fn dumpDebugState(self: *Audio, config: DebugCapture) !void {
         var path_buf: [256]u8 = undefined;
         const path = try std.fmt.bufPrint(&path_buf, "{s}_frame.bin", .{config.prefix});
-        var file = try std.fs.cwd().createFile(path, .{ .truncate = true });
-        defer file.close();
+        var file = try std.Io.Dir.cwd().createFile(self.io, path, .{ .truncate = true });
+        defer file.close(self.io);
+        var file_buffer: [4096]u8 = undefined;
+        var file_writer = file.writer(self.io, &file_buffer);
+        const writer = &file_writer.interface;
 
         for (0..2) |ch| {
             for (0..32) |sb| {
                 if (self.allocation[ch][sb]) |q| {
                     var buf_levels: [2]u8 = undefined;
                     std.mem.writeInt(u16, &buf_levels, q.levels, .little);
-                    try file.writeAll(&buf_levels);
-                    try file.writeAll(&[_]u8{q.group});
-                    try file.writeAll(&[_]u8{q.bits});
+                    try writer.writeAll(&buf_levels);
+                    try writer.writeAll(&[_]u8{q.group});
+                    try writer.writeAll(&[_]u8{q.bits});
                 } else {
                     const zero16: [2]u8 = .{ 0, 0 };
-                    try file.writeAll(&zero16);
-                    try file.writeAll(&[_]u8{0});
-                    try file.writeAll(&[_]u8{0});
+                    try writer.writeAll(&zero16);
+                    try writer.writeAll(&[_]u8{0});
+                    try writer.writeAll(&[_]u8{0});
                 }
             }
         }
 
-        try file.writeAll(std.mem.asBytes(&self.scale_factor_info));
-        try file.writeAll(std.mem.asBytes(&self.scale_factor));
-        try file.writeAll(std.mem.asBytes(&self.sample));
-        try file.writeAll(std.mem.asBytes(&self.V));
-        try file.writeAll(std.mem.asBytes(&self.U));
+        try writer.writeAll(std.mem.asBytes(&self.scale_factor_info));
+        try writer.writeAll(std.mem.asBytes(&self.scale_factor));
+        try writer.writeAll(std.mem.asBytes(&self.sample));
+        try writer.writeAll(std.mem.asBytes(&self.V));
+        try writer.writeAll(std.mem.asBytes(&self.U));
 
         const v_pos_i32: i32 = self.v_pos;
-        try file.writeAll(std.mem.asBytes(&v_pos_i32));
+        try writer.writeAll(std.mem.asBytes(&v_pos_i32));
+        try writer.flush();
     }
 };
 

@@ -15,7 +15,7 @@ zig build run -- trouble-pogo.mp4
 ```zig
 const zmpeg = @import("zmpeg");
 
-var mpeg = try zmpeg.createFromFile(allocator, "video.mpg");
+var mpeg = try zmpeg.createFromFile(allocator, io, "video.mpg");
 defer mpeg.deinit();
 
 var player = zmpeg.Player.init(mpeg);
@@ -48,14 +48,14 @@ if (mpeg.audio_decoder) |audio| {
 
 ```zig
 // From file
-const mpeg = try zmpeg.createFromFile(allocator, "video.mpg");
+const mpeg = try zmpeg.createFromFile(allocator, io, "video.mpg");
 
 // From memory
-const mpeg = try zmpeg.createFromMemory(allocator, data);
+const mpeg = try zmpeg.createFromMemory(allocator, io, data);
 
 // Custom reader (streaming)
 var reader = try zmpeg.BitReader.initAppend(allocator, 1024);
-const mpeg = try zmpeg.createWithReader(allocator, &reader);
+const mpeg = try zmpeg.createWithReader(allocator, io, &reader);
 ```
 
 See `src/main.zig` for a complete SDL2 player example.

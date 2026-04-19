@@ -14,32 +14,32 @@ pub const Mpeg = mpeg_mod.Mpeg;
 pub const Audio = audio_mod.Audio;
 pub const Player = player_mod.Player;
 
-pub fn createFromFile(allocator: std.mem.Allocator, path: []const u8) !*Mpeg {
+pub fn createFromFile(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !*Mpeg {
     const reader_ptr = try allocator.create(BitReader);
     errdefer allocator.destroy(reader_ptr);
 
-    reader_ptr.* = try BitReader.initFromFile(allocator, path);
+    reader_ptr.* = try BitReader.initFromFile(allocator, io, path);
     errdefer reader_ptr.deinit();
 
-    const mpeg = try Mpeg.init(allocator, reader_ptr);
+    const mpeg = try Mpeg.init(allocator, io, reader_ptr);
     mpeg.owns_source_reader = true;
     return mpeg;
 }
 
-pub fn createFromMemory(allocator: std.mem.Allocator, data: []const u8) !*Mpeg {
+pub fn createFromMemory(allocator: std.mem.Allocator, io: std.Io, data: []const u8) !*Mpeg {
     const reader_ptr = try allocator.create(BitReader);
     errdefer allocator.destroy(reader_ptr);
 
     reader_ptr.* = BitReader.initFromMemory(allocator, data);
     errdefer reader_ptr.deinit();
 
-    const mpeg = try Mpeg.init(allocator, reader_ptr);
+    const mpeg = try Mpeg.init(allocator, io, reader_ptr);
     mpeg.owns_source_reader = true;
     return mpeg;
 }
 
-pub fn createWithReader(allocator: std.mem.Allocator, reader: *BitReader) !*Mpeg {
-    return Mpeg.init(allocator, reader);
+pub fn createWithReader(allocator: std.mem.Allocator, io: std.Io, reader: *BitReader) !*Mpeg {
+    return Mpeg.init(allocator, io, reader);
 }
 
 pub const PLM_PACKET_INVALID_TS = types.PLM_PACKET_INVALID_TS;

@@ -9,6 +9,7 @@ const PacketType = types.PacketType;
 
 pub const Mpeg = struct {
     allocator: std.mem.Allocator,
+    io: std.Io,
 
     demux: *Demux,
     source_reader: *BitReader,
@@ -29,10 +30,11 @@ pub const Mpeg = struct {
     audio_decoder: ?*Audio = null,
     audio_reader: ?*BitReader = null,
 
-    pub fn init(allocator: std.mem.Allocator, reader: *BitReader) !*Mpeg {
+    pub fn init(allocator: std.mem.Allocator, io: std.Io, reader: *BitReader) !*Mpeg {
         const self = try allocator.create(Mpeg);
         self.* = .{
             .allocator = allocator,
+            .io = io,
             .demux = try Demux.init(allocator, reader),
             .source_reader = reader,
             .owns_source_reader = false,
@@ -115,6 +117,7 @@ pub const Mpeg = struct {
                 try self.ensureVideoSequenceHeader(reader_ptr);
                 self.video_decoder = try Video.init(
                     self.allocator,
+                    self.io,
                     reader_ptr,
                     false,
                 );
@@ -135,6 +138,7 @@ pub const Mpeg = struct {
                     self.audio_reader.?.* = BitReader.initAppend(self.allocator, 1024) catch return false;
                     self.audio_decoder = try Audio.init(
                         self.allocator,
+                        self.io,
                         self.audio_reader.?,
                         true, // Use interleaved format for SDL
                     );

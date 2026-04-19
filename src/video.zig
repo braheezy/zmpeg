@@ -66,11 +66,13 @@ pub const Video = struct {
     assume_no_b_frames: bool = false,
 
     debug_frame: ?u32 = null,
+    io: std.Io,
 
-    pub fn init(allocator: std.mem.Allocator, reader: *BitReader, own_reader: bool) !*Video {
+    pub fn init(allocator: std.mem.Allocator, io: std.Io, reader: *BitReader, own_reader: bool) !*Video {
         const video = try allocator.create(Video);
         video.* = .{
             .allocator = allocator,
+            .io = io,
             .reader = reader,
             .own_reader = own_reader,
         };
@@ -358,9 +360,9 @@ pub const Video = struct {
 
             var name_buf: [64]u8 = undefined;
             if (std.fmt.bufPrint(&name_buf, "zig_future_frame{d}_y.bin", .{self.frames_decoded}) catch null) |path| {
-                if (std.fs.cwd().createFile(path, .{ .truncate = true }) catch null) |file| {
-                    defer file.close();
-                    _ = file.write(fb_after) catch null;
+                if (std.Io.Dir.cwd().createFile(self.io, path, .{ .truncate = true }) catch null) |file| {
+                    defer file.close(self.io);
+                    _ = file.writePositionalAll(self.io, fb_after, 0) catch null;
                 }
             }
         }

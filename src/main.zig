@@ -17,8 +17,8 @@ const App = struct {
     last_time: f64 = 0,
     wants_to_quit: bool = false,
 
-    fn init(allocator: std.mem.Allocator, path: []const u8) !*App {
-        var mpeg = try zmpeg.createFromFile(allocator, path);
+    fn init(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !*App {
+        var mpeg = try zmpeg.createFromFile(allocator, io, path);
         errdefer mpeg.deinit();
 
         const width = mpeg.getWidth();
@@ -207,27 +207,17 @@ const App = struct {
     }
 };
 
-pub fn main() !void {
-    const allocator, const is_debug = gpa: {
-        if (builtin.os.tag == .wasi) break :gpa .{ std.heap.wasm_allocator, false };
-        break :gpa switch (builtin.mode) {
-            .Debug, .ReleaseSafe => .{ debug_allocator.allocator(), true },
-            .ReleaseFast, .ReleaseSmall => .{ std.heap.smp_allocator, false },
-        };
-    };
-    defer if (is_debug) {
-        _ = debug_allocator.deinit();
-    };
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
 
-    const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
+    const args = try init.minimal.args.toSlice(init.arena.allocator());
 
     if (args.len < 2) {
         std.debug.print("Usage: player <video-file.mpg>\n", .{});
         return error.MissingArgument;
     }
 
-    var app = try App.init(allocator, args[1]);
+    var app = try App.init(allocator, init.io, args[1]);
     defer app.deinit();
 
     while (!app.wants_to_quit) {

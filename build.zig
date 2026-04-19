@@ -26,7 +26,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
-    sdk.link(exe, .static, sdl.Library.SDL2);
+    sdk.link(b.graph.io, exe, .static, sdl.Library.SDL2);
 
     b.installArtifact(exe);
 
