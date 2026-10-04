@@ -213,11 +213,27 @@ pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
 
     if (args.len < 2) {
-        std.debug.print("Usage: player <video-file.mpg>\n", .{});
+        std.debug.print("Usage: player <video-file.mpg|video-file.mp4>\n", .{});
         return error.MissingArgument;
     }
 
-    var app = try App.init(allocator, init.io, args[1]);
+    const input_path = args[1];
+    const converted_path = if (std.ascii.endsWithIgnoreCase(input_path, ".mp4"))
+        try allocator.print("{s}.mpg", .{input_path[0 .. input_path.len - 4]})
+    else
+        null;
+    defer if (converted_path) |path| allocator.free(path);
+
+    if (converted_path) |path| {
+        var child = try std.process.spawn(init.io, .{
+            .argv = &.{ "ffmpeg", "-y", "-i", input_path, "-q:v", "2", "-q:a", "2", "-f", "mpeg", path },
+        });
+        defer child.kill(init.io);
+        const term = try child.wait(init.io);
+        if (!term.success()) return error.VideoConversionFailed;
+    }
+
+    var app = try App.init(allocator, init.io, converted_path orelse input_path);
     defer app.deinit();
 
     while (!app.wants_to_quit) {

@@ -58,9 +58,9 @@ pub const Video = struct {
 
     frames_data: []u8 = &[_]u8{},
 
-    block_data: [64]i32 = .{0} ** 64,
-    intra_quant_matrix: [64]u8 = .{0} ** 64,
-    non_intra_quant_matrix: [64]u8 = .{0} ** 64,
+    block_data: [64]i32 = @splat(0),
+    intra_quant_matrix: [64]u8 = @splat(0),
+    non_intra_quant_matrix: [64]u8 = @splat(0),
 
     has_reference_frame: bool = false,
     assume_no_b_frames: bool = false,
@@ -659,7 +659,7 @@ pub const Video = struct {
 
         var s = self.block_data[0..];
         const si = 0;
-        var before: [8]u8 = .{0} ** 8;
+        var before: [8]u8 = @splat(0);
         var before_len: usize = 0;
         const dest_index = if (di >= 0) @as(usize, @intCast(di)) else 0;
         const dest_valid = di >= 0 and dest_index < d.len;

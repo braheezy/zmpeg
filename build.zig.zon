@@ -5,8 +5,9 @@
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .sdl = .{
-            .url = "git+https://github.com/braheezy/SDL.zig#a1c36303a95c37ba36c69b19f79683f2eb5050b4",
-            .hash = "SDL2-0.0.0-yMCQipWnBABMAdfue6YmerIoyHg-6r3f3zapmQoy9teu",
+            .path = "../SDL.zig",
+            // .url = "git+https://github.com/braheezy/SDL.zig#a1c36303a95c37ba36c69b19f79683f2eb5050b4",
+            // .hash = "SDL2-0.0.0-yMCQipWnBABMAdfue6YmerIoyHg-6r3f3zapmQoy9teu",
         },
     },
     .paths = .{
